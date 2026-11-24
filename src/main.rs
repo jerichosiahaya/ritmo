@@ -1,20 +1,24 @@
 mod engine;
 mod project;
+mod rt;
 mod widgets;
 mod windows;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{self, Color32, Key, RichText};
-use engine::{Cmd, Engine, Song, CHORDS, METERS, STEPS};
+use engine::{Cmd, Engine, Snapshot, Song, CHORDS, METERS, STEP, STEPS};
+use project::Project;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use widgets::*;
 
-/// Holds the audio stream open. `pos` is the playing step + 1 (0 = stopped);
+/// Holds the audio stream open. `pos` is the playing tick + 1 (0 = stopped);
 /// `meters` hold f32 peak bits (positive floats order like their bits, so fetch_max works).
+/// `trash` brings back snapshots the engine replaced, to be freed on the UI thread.
 struct Audio {
     _stream: cpal::Stream,
     tx: mpsc::SyncSender<Cmd>,
+    trash: mpsc::Receiver<Box<Snapshot>>,
     pos: Arc<AtomicUsize>,
     meters: Arc<[AtomicU32; METERS]>,
 }
@@ -23,9 +27,10 @@ fn start_audio() -> Result<Audio, String> {
     let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
     let config = device.default_output_config().map_err(|e| e.to_string())?;
     let (tx, rx) = engine::command_channel();
+    let (trash_tx, trash) = engine::trash_channel();
     let pos = Arc::new(AtomicUsize::new(0));
     let meters: Arc<[AtomicU32; METERS]> = Arc::new(std::array::from_fn(|_| AtomicU32::new(0)));
-    let shared = (rx, pos.clone(), meters.clone());
+    let shared = (rx, trash_tx, pos.clone(), meters.clone());
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => build::<f32>(&device, config.into(), shared),
         cpal::SampleFormat::I16 => build::<i16>(&device, config.into(), shared),
@@ -33,19 +38,20 @@ fn start_audio() -> Result<Audio, String> {
         f => return Err(format!("unsupported sample format {f}")),
     }?;
     stream.play().map_err(|e| e.to_string())?;
-    Ok(Audio { _stream: stream, tx, pos, meters })
+    Ok(Audio { _stream: stream, tx, trash, pos, meters })
 }
 
-type Shared = (mpsc::Receiver<Cmd>, Arc<AtomicUsize>, Arc<[AtomicU32; METERS]>);
+type Shared = (mpsc::Receiver<Cmd>, mpsc::SyncSender<Box<Snapshot>>, Arc<AtomicUsize>, Arc<[AtomicU32; METERS]>);
 
 fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(device: &cpal::Device, config: cpal::StreamConfig, shared: Shared) -> Result<cpal::Stream, String> {
-    let (rx, pos, meters) = shared;
+    let (rx, trash, pos, meters) = shared;
     let channels = config.channels as usize;
-    let mut eng = Engine::new(config.sample_rate as f32);
+    let mut eng = Engine::new(config.sample_rate as f32).with_trash(trash);
     device
         .build_output_stream(
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                rt::enter();
                 while let Ok(cmd) = rx.try_recv() {
                     eng.handle(cmd);
                 }
@@ -55,16 +61,20 @@ fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(device: &cpal::Device, co
                         *s = T::from_sample(if i % 2 == 0 { l } else { r });
                     }
                 }
-                pos.store(if eng.playing { eng.step + 1 } else { 0 }, Ordering::Relaxed);
+                pos.store(if eng.playing { eng.tick as usize + 1 } else { 0 }, Ordering::Relaxed);
                 for (m, p) in meters.iter().zip(eng.take_peaks()) {
                     m.fetch_max(p.to_bits(), Ordering::Relaxed);
                 }
+                rt::exit();
             },
             |e| eprintln!("audio error: {e}"),
             None,
         )
         .map_err(|e| e.to_string())
 }
+
+/// Channel index that live notes play on (Lead).
+pub const LIVE_CHANNEL: u16 = 5;
 
 /// Typing keyboard as piano: bottom row = C3 octave, top row = C4 octave.
 fn key_note(k: Key) -> Option<u8> {
@@ -131,7 +141,7 @@ impl App {
     }
 
     fn export(&mut self) {
-        let song = self.song;
+        let snap = Project::from(&self.song).compile();
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let dir = std::path::Path::new(&home).join("Music");
         let dir = if dir.is_dir() { dir } else { std::path::PathBuf::from(".") };
@@ -140,7 +150,7 @@ impl App {
         self.status = "Exporting…".into();
         self.export_rx = Some(rx);
         std::thread::spawn(move || {
-            let msg = match engine::export_wav(&path, song) {
+            let msg = match engine::export_wav(&path, &snap) {
                 Ok(()) => format!("Exported {}", path.display()),
                 Err(e) => format!("Export failed: {e}"),
             };
@@ -161,7 +171,8 @@ impl App {
             } else if key == Key::Space && pressed {
                 self.set_playing(!self.playing);
             } else if let Some(n) = key_note(key) {
-                self.send(if pressed { Cmd::NoteOn(n) } else { Cmd::NoteOff(n) });
+                let channel = LIVE_CHANNEL;
+                self.send(if pressed { Cmd::NoteOn { channel, pitch: n } } else { Cmd::NoteOff { channel, pitch: n } });
             }
         }
     }
@@ -249,7 +260,9 @@ impl eframe::App for App {
             self.export_rx = None;
         }
         if let Some(a) = &self.audio {
-            self.cur = a.pos.load(Ordering::Relaxed).checked_sub(1);
+            self.cur = a.pos.load(Ordering::Relaxed).checked_sub(1).map(|tick| tick / STEP as usize);
+            // Snapshots the engine replaced are freed here, off the audio thread.
+            while a.trash.try_recv().is_ok() {}
             for (shown, m) in self.meters.iter_mut().zip(a.meters.iter()) {
                 *shown = (*shown * 0.85).max(f32::from_bits(m.swap(0, Ordering::Relaxed)));
             }
@@ -265,7 +278,15 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(RichText::new("Keys: Z–M = C3 octave · Q–P = C4 octave · Space play/stop · F5 Playlist · F6 Rack · F7 Piano Roll · F9 Mixer").small().weak());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(RichText::new(&self.status).small()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(&self.status).small());
+                        // Debug builds only: the real-time guard saw the audio thread use the heap.
+                        let heap = rt::violations();
+                        if heap > 0 {
+                            ui.label(RichText::new(format!("⚠ audio thread used the heap {heap}×")).small().color(ACCENT_HOT))
+                                .on_hover_text("Debug build check: the audio callback allocated or freed memory, which can cause dropouts. See AGENTS.md.");
+                        }
+                    });
                 });
             });
         egui::Panel::left("browser").default_size(170.0).resizable(true).show(ui, |ui| self.browser(ui));
@@ -281,7 +302,7 @@ impl eframe::App for App {
         windows::show(self, &ctx, area);
 
         // If the queue was full, `sent` stays stale and the song goes out on the next frame.
-        if self.sent != Some(self.song) && self.send(Cmd::Song(self.song)) {
+        if self.sent != Some(self.song) && self.send(Cmd::Snapshot(Box::new(Project::from(&self.song).compile()))) {
             self.sent = Some(self.song);
         }
         if self.playing || self.export_rx.is_some() || self.meters.iter().any(|&m| m > 1e-3) {

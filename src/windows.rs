@@ -2,7 +2,7 @@
 
 use crate::engine::*;
 use crate::widgets::*;
-use crate::{chord_color, App, Win};
+use crate::{chord_color, App, Win, LIVE_CHANNEL};
 use eframe::egui::{self, vec2, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
 
 const CLIP_TEXT: Color32 = Color32::from_rgb(22, 24, 28);
@@ -155,9 +155,9 @@ fn piano_roll(app: &mut App, ui: &mut Ui) {
             Some((p, pitch)) if p.x < grid.left() => {
                 if app.preview != Some(pitch) {
                     if let Some(old) = app.preview {
-                        app.send(Cmd::NoteOff(old));
+                        app.send(Cmd::NoteOff { channel: LIVE_CHANNEL, pitch: old });
                     }
-                    app.send(Cmd::NoteOn(pitch));
+                    app.send(Cmd::NoteOn { channel: LIVE_CHANNEL, pitch });
                     app.preview = Some(pitch);
                 }
             }
@@ -172,7 +172,7 @@ fn piano_roll(app: &mut App, ui: &mut Ui) {
         if pointer.is_none() {
             app.roll_paint = None;
             if let Some(n) = app.preview.take() {
-                app.send(Cmd::NoteOff(n));
+                app.send(Cmd::NoteOff { channel: LIVE_CHANNEL, pitch: n });
             }
         }
 
@@ -392,7 +392,7 @@ fn mixer(app: &mut App, ui: &mut Ui) {
             strip(ui, BUS_NAMES[b], color, &mut app.song.bus[b], app.meters[b]);
         }
         ui.separator();
-        strip(ui, "Master", ACCENT, &mut app.song.fx.volume, app.meters[BUSES]);
+        strip(ui, "Master", ACCENT, &mut app.song.fx.volume, app.meters[MASTER]);
         ui.separator();
         egui::Frame::new().fill(BG_PANEL).corner_radius(3).inner_margin(8).show(ui, |ui| {
             ui.vertical(|ui| {

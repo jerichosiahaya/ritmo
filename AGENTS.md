@@ -15,24 +15,26 @@ Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian
 
 ## Layout
 
-- `src/engine.rs`: everything audio, with no I/O and no UI. It holds the synths (drums, FM Rhodes, sine bass), the step and melody sequencer, the mixer (channels → buses → master) and the lo-fi master chain. `render_offline` and `export_wav` use the same engine as live playback.
-- `src/project.rs`: the v0.2 project model (channels, mixer tracks, patterns with notes, playlist tracks and clips, all with stable IDs; time in ticks, `PPQ` = 96). It sits next to `Song` until the engine and UI move onto it (roadmap week 2). `Project::from(&song)` converts the old song, and `validate()` checks every invariant. Keep `validate()` and its tests in step with any new field.
+- `src/engine.rs`: everything audio, with no I/O and no UI. It plays a `Snapshot` (channels, mixer tracks and notes placed in song time, in ticks) with the synths (drums, FM Rhodes, sine bass), the mixer (channels → mixer tracks → master) and the lo-fi master chain. `render_offline` and `export_wav` use the same engine as live playback.
+- `src/project.rs`: the v0.2 project model (channels, mixer tracks, patterns with notes, playlist tracks and clips, all with stable IDs; time in ticks, `PPQ` = 96). `compile()` builds the engine's `Snapshot`; `Project::from(&song)` converts the old song; `validate()` checks every invariant. Keep `validate()` and its tests in step with any new field.
+- `src/rt.rs`: the real-time guard. In debug and test builds it counts heap use inside `rt::enter()`/`rt::exit()` (the audio callback); the status bar shows a warning if it ever happens.
 - `src/main.rs`: app state (`App`), the cpal audio stream, toolbar, browser panel, keyboard shortcuts.
 - `src/windows.rs`: the floating windows (Playlist, Channel Rack, Piano Roll, Mixer).
 - `src/widgets.rs`: theme colors and custom widgets (knob, LED, step button, meter, LCD).
 
 ## How data flows
 
-- `Song` is a plain `Copy` struct holding the whole project. The UI edits its own copy and sends `Cmd::Song(song)` by value whenever it changes.
+- The UI edits its state and, whenever it changes, compiles a `Snapshot` and sends it whole as `Cmd::Snapshot(Box<Snapshot>)`. (For now the UI still edits the v0.1 `Song` and converts it with `Project::from(&song).compile()`.)
 - The audio thread owns the `Engine` and drains the bounded queue from `engine::command_channel()` at the start of each callback. The UI sends with `try_send` and never blocks. Don't switch to an unbounded `mpsc::channel`: its receiver frees memory on the audio thread.
+- The engine never drops a snapshot: it sends the one it replaces back through `engine::trash_channel()`, and the UI drops it each frame.
 - The audio thread reports back only through atomics: `pos` (playing step + 1, or 0 when stopped) and `meters` (f32 peak bits, merged with `fetch_max`).
 
 ## Rules
 
-- **Audio thread:** never allocate, lock, log or do I/O inside the cpal callback or in `Engine::next_frame`. Allocate buffers in `Engine::new`. Keep `Song` `Copy`: use fixed-size arrays (for example the `u64` bitmasks in `melody`), not `Vec`.
+- **Audio thread:** never allocate, free, lock, log or do I/O inside the cpal callback or in `Engine::next_frame`. Allocate buffers in `Engine::new` (per-channel state is sized by `MAX_CHANNELS`/`MAX_MIXER`). Anything with heap data reaches the engine inside a `Snapshot` and leaves through the trash queue.
 - The test `audio_path_never_allocates_or_frees` counts heap operations on the audio path; keep it passing.
 - **Engine changes need a test** in `engine.rs` (render a few thousand frames and check levels, timing or state). Tests use low sample rates (8–22 kHz) to stay fast.
-- **Sequencer timing:** `BARS` × `STEPS` 16th steps; swing shortens odd steps and keeps each pair the same length (`step_len`).
+- **Sequencer timing:** ticks, `PPQ` = 96 per quarter note (`STEP` = 24 is a 16th). Swing lengthens the first 16th of each 8th-note pair and shortens the second, keeping the pair's length (`tick_len`). A note at tick `t` starts when the engine reaches `t`; notes end at their `end` tick; wrapping at the loop end releases held notes.
 - **UI:** egui 0.37 / eframe 0.37 (`App::ui`, `egui::Panel`, `Ui::scope_id`). Use the colors in `widgets.rs` instead of new hard-coded ones. New controls need hover text, and custom widgets set `widget_info` for accessibility.
 - **Original look:** the layout follows common pattern-DAW conventions; do not copy other products' logos, skins or branding.
 - Keep changes small and in the existing structure. Do not add dependencies for things a few lines can do.

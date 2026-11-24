@@ -9,23 +9,25 @@
 //!
 //! IDs come from one counter per project and are never reused, even after a delete.
 
-// Week 2 of the roadmap moves the engine and UI onto this model; until then only tests use it.
+// The UI still edits `Song` and only converts and compiles it; the rest of this API is used once
+// the UI moves onto `Project` (roadmap week 2, second step).
 #![allow(dead_code)]
 
-use crate::engine::{BARS, BUS_NAMES, CHANNEL_NAMES, CHORDS, CH_BUS, Fx, LEAD_KEYS, LEAD_LOW, STEPS, Song, TOTAL_STEPS, TRACKS};
+use crate::engine::{
+    BARS, BUS_NAMES, CHANNEL_NAMES, CHORDS, CH_BUS, ChannelMix, FX_NEUTRAL, Fx, LEAD_KEYS, LEAD_LOW, MAX_CHANNELS, MAX_MIXER, MixerMix, STEPS, SeqNote, Snapshot, Song,
+    TOTAL_STEPS, TRACKS, pan_gains,
+};
+pub use crate::engine::{Instrument, PPQ, STEP, Tick};
 use std::collections::HashSet;
 
-pub type Tick = u32;
-/// Ticks per quarter note. Divides evenly into 16ths (24) and 8th-note triplets (32).
-pub const PPQ: Tick = 96;
-/// One 16th note: the step sequencer's grid.
-pub const STEP: Tick = PPQ / 4;
 /// Longest song the playlist allows.
 pub const MAX_BARS: Tick = 999;
 /// Pitch the step sequencer writes (drum instruments ignore pitch).
 pub const STEP_PITCH: u8 = 60;
-/// Velocity for new notes (1..=127, like MIDI).
+/// Velocity for new notes (1..=127, like MIDI). 100 plays an instrument at its normal level.
 pub const DEFAULT_VEL: u8 = 100;
+/// Velocity of converted chord notes: softer than a melody on the same electric piano.
+pub const CHORD_VEL: u8 = 53;
 
 macro_rules! ids {
     ($($(#[$doc:meta])* $name:ident),* $(,)?) => {$(
@@ -47,18 +49,6 @@ ids!(
     /// One placement of a pattern on a playlist track.
     ClipId,
 );
-
-/// Built-in instruments the engine can play.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Instrument {
-    Kick,
-    Snare,
-    Hat,
-    /// FM electric piano.
-    Rhodes,
-    /// Sine bass.
-    Bass,
-}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Channel {
@@ -157,7 +147,7 @@ impl Default for Project {
             bpm: 120.0,
             swing: 0.5,
             beats_per_bar: 4,
-            master: Fx { tone: 1.0, crush: 0.0, wobble: 0.0, vinyl: 0.0, reverb: 0.0, volume: 0.8 },
+            master: FX_NEUTRAL,
             channels: Vec::new(),
             mixer: Vec::new(),
             patterns: Vec::new(),
@@ -184,15 +174,22 @@ impl Project {
         self.clips.iter().map(Clip::end).max().unwrap_or(0)
     }
 
-    pub fn add_mixer_track(&mut self, name: &str) -> MixerId {
+    /// None if the mixer already has `MAX_MIXER` tracks.
+    pub fn add_mixer_track(&mut self, name: &str) -> Option<MixerId> {
+        if self.mixer.len() >= MAX_MIXER {
+            return None;
+        }
         let id = MixerId(self.fresh_id());
         self.mixer.push(MixerTrack { id, name: name.into(), vol: 0.8, pan: 0.0, mute: false });
-        id
+        Some(id)
     }
 
-    /// None if `mixer` does not exist.
+    /// None if `mixer` does not exist or there are already `MAX_CHANNELS` channels.
     pub fn add_channel(&mut self, name: &str, instrument: Instrument, mixer: MixerId) -> Option<ChannelId> {
         self.mixer_track(mixer)?;
+        if self.channels.len() >= MAX_CHANNELS {
+            return None;
+        }
         let id = ChannelId(self.fresh_id());
         self.channels.push(Channel { id, name: name.into(), instrument, vol: 0.8, pan: 0.0, mute: false, mixer });
         Some(id)
@@ -288,6 +285,48 @@ impl Project {
         self.clips.iter().find(|c| c.id == id)
     }
 
+    /// Builds what the engine plays: indices instead of IDs, volume and pan as gains, and every
+    /// clip's notes placed in song time, sorted by start. Notes starting outside a clip's part of
+    /// the pattern are skipped; notes running past the clip's end are cut there. Without a loop
+    /// range, playback loops the song rounded up to whole bars.
+    pub fn compile(&self) -> Snapshot {
+        let gains = |vol: f32, pan: f32| {
+            let (l, r) = pan_gains(pan);
+            [vol * l, vol * r]
+        };
+        let channels: Vec<ChannelMix> = self
+            .channels
+            .iter()
+            .take(MAX_CHANNELS)
+            .map(|c| ChannelMix {
+                instrument: c.instrument,
+                gain: gains(c.vol, c.pan),
+                mute: c.mute,
+                mixer: self.mixer.iter().take(MAX_MIXER).position(|m| m.id == c.mixer).unwrap_or(0),
+            })
+            .collect();
+        let mixer = self.mixer.iter().take(MAX_MIXER).map(|m| MixerMix { gain: gains(m.vol, m.pan), mute: m.mute }).collect();
+        let index = |id: ChannelId| self.channels.iter().take(MAX_CHANNELS).position(|c| c.id == id);
+
+        let mut notes = Vec::new();
+        for clip in &self.clips {
+            let (Some(track), Some(pattern)) = (self.track(clip.track), self.pattern(clip.pattern)) else { continue };
+            if track.mute {
+                continue;
+            }
+            for n in pattern.notes.iter().filter(|n| (clip.offset..clip.offset + clip.len).contains(&n.start)) {
+                let Some(channel) = index(n.channel) else { continue };
+                let start = clip.start + n.start - clip.offset;
+                notes.push(SeqNote { start, end: (start + n.len).min(clip.end()), channel: channel as u16, pitch: n.pitch, vel: n.vel });
+            }
+        }
+        notes.sort_by_key(|n| (n.start, n.channel, n.pitch));
+
+        let bar = self.bar_len();
+        let (loop_start, loop_end) = self.loop_range.unwrap_or((0, self.end().div_ceil(bar).max(1) * bar));
+        Snapshot { bpm: self.bpm, swing: self.swing, fx: self.master, channels, mixer, notes, loop_start, loop_end }
+    }
+
     /// Checks every invariant: unique IDs no higher than the counter, references that resolve,
     /// non-empty notes and clips inside their limits. Loading a file will run this.
     pub fn validate(&self) -> Result<(), String> {
@@ -299,6 +338,9 @@ impl Project {
         }
         if !(1..=16).contains(&self.beats_per_bar) {
             return Err(format!("{} beats per bar", self.beats_per_bar));
+        }
+        if self.channels.len() > MAX_CHANNELS || self.mixer.len() > MAX_MIXER {
+            return Err(format!("{} channels and {} mixer tracks; the limits are {MAX_CHANNELS} and {MAX_MIXER}", self.channels.len(), self.mixer.len()));
         }
         let ids = self
             .mixer
@@ -367,7 +409,7 @@ impl From<&Song> for Project {
             .iter()
             .zip(s.bus)
             .map(|(name, vol)| {
-                let id = p.add_mixer_track(name);
+                let id = p.add_mixer_track(name).expect("under the mixer limit");
                 p.mixer.last_mut().expect("just added").vol = vol;
                 id
             })
@@ -396,7 +438,7 @@ impl From<&Song> for Project {
             let c = &CHORDS[j.min(CHORDS.len() - 1)];
             let start = b as Tick * bar;
             for &n in c.notes {
-                p.add_note(chords, keys, n, start, bar, DEFAULT_VEL);
+                p.add_note(chords, keys, n, start, bar, CHORD_VEL);
             }
             if c.bass > 0 {
                 p.add_note(chords, bass, c.bass, start, bar, DEFAULT_VEL);
@@ -462,7 +504,7 @@ mod tests {
     /// A small project built through the API: one mixer track, channel, pattern, track, clip.
     fn tiny() -> (Project, ChannelId, PatternId, TrackId, ClipId) {
         let mut p = Project::default();
-        let m = p.add_mixer_track("Main");
+        let m = p.add_mixer_track("Main").unwrap();
         let ch = p.add_channel("Kick", Instrument::Kick, m).unwrap();
         let pat = p.add_pattern("Beat", BAR);
         p.add_note(pat, ch, STEP_PITCH, 0, STEP, DEFAULT_VEL).unwrap();
@@ -569,6 +611,74 @@ mod tests {
                 assert_eq!(got, want, "bar {b}");
             }
         }
+    }
+
+    #[test]
+    fn compile_places_clip_notes_in_song_time() {
+        let mut p = Project::default();
+        let (m, m2) = (p.add_mixer_track("Main").unwrap(), p.add_mixer_track("Keys").unwrap());
+        let kick = p.add_channel("Kick", Instrument::Kick, m).unwrap();
+        let keys = p.add_channel("Keys", Instrument::Rhodes, m2).unwrap();
+        p.channels[1].pan = -1.0;
+        let pat = p.add_pattern("P", 2 * BAR);
+        p.add_note(pat, kick, STEP_PITCH, 0, STEP, 100).unwrap();
+        p.add_note(pat, keys, 60, BAR - STEP, 2 * STEP, 90).unwrap(); // crosses into the pattern's bar 2
+        p.add_note(pat, keys, 64, BAR + STEP, STEP, 80).unwrap();
+        let t = p.add_track("T");
+        p.add_clip(t, pat, 0, BAR).unwrap(); // the pattern's bar 1, at bar 1
+        p.add_clip(t, pat, 2 * BAR, BAR).unwrap(); // the pattern's bar 2, at bar 3
+        p.clips[1].offset = BAR;
+        let s = p.compile();
+        assert_eq!((s.channels.len(), s.mixer.len(), s.channels[1].mixer), (2, 2, 1));
+        assert!(s.channels[1].gain[1].abs() < 1e-6 && s.channels[1].gain[0] > 0.8);
+        assert_eq!((s.bpm, s.swing, s.fx), (p.bpm, p.swing, p.master));
+        let got: Vec<(Tick, Tick, u16, u8, u8)> = s.notes.iter().map(|n| (n.start, n.end, n.channel, n.pitch, n.vel)).collect();
+        assert_eq!(
+            got,
+            [
+                (0, STEP, 0, STEP_PITCH, 100),
+                // Cut at the end of the first clip, and not repeated in the second (it starts
+                // before that clip's offset).
+                (BAR - STEP, BAR, 1, 60, 90),
+                (2 * BAR + STEP, 2 * BAR + 2 * STEP, 1, 64, 80),
+            ]
+        );
+        assert_eq!((s.loop_start, s.loop_end), (0, 3 * BAR));
+
+        // The loop rounds up to whole bars; a loop range overrides it; muted tracks are silent.
+        p.add_clip(t, pat, 3 * BAR, STEP).unwrap();
+        assert_eq!(p.compile().loop_end, 4 * BAR);
+        p.loop_range = Some((BAR, 2 * BAR));
+        p.tracks[0].mute = true;
+        let s = p.compile();
+        assert!(s.notes.is_empty());
+        assert_eq!((s.loop_start, s.loop_end), (BAR, 2 * BAR));
+        assert_eq!(Project::default().compile().loop_end, BAR);
+    }
+
+    #[test]
+    fn demo_song_compiles() {
+        let s = Project::from(&Song::default()).compile();
+        // 13 drum hits x 4 bars, 4 chords of 5 notes, 6 melody notes; 4 bars long.
+        assert_eq!(s.notes.len(), 13 * 4 + 20 + 6);
+        assert_eq!((s.loop_start, s.loop_end), (0, 4 * BAR));
+        assert!(s.notes.windows(2).all(|w| w[0].start <= w[1].start));
+        assert!(s.notes.iter().filter(|n| n.channel == 3).all(|n| n.vel == CHORD_VEL));
+    }
+
+    #[test]
+    fn channel_and_mixer_limits() {
+        let mut p = Project::default();
+        let m = p.add_mixer_track("0").unwrap();
+        for i in 1..MAX_MIXER {
+            p.add_mixer_track(&i.to_string()).unwrap();
+        }
+        assert!(p.add_mixer_track("too many").is_none());
+        for i in 0..MAX_CHANNELS {
+            p.add_channel(&i.to_string(), Instrument::Hat, m).unwrap();
+        }
+        assert!(p.add_channel("too many", Instrument::Hat, m).is_none());
+        p.validate().unwrap();
     }
 
     #[test]

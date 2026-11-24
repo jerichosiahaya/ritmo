@@ -1,5 +1,9 @@
-//! Audio engine: synthesized drums, FM Rhodes, sine bass, melody sequencer, mixer and lo-fi master chain.
-//! Pure Rust and no I/O, so the same engine plays live and renders WAV exports.
+//! Audio engine: synthesized drums, FM Rhodes, sine bass, a note sequencer, the mixer and the
+//! lo-fi master chain. Pure Rust with no I/O, so the same engine plays live and renders exports.
+//!
+//! The engine plays a [`Snapshot`]: an immutable, engine-ready copy of the project that the UI
+//! builds (`Project::compile`) and sends whole. The engine sends each snapshot it replaces back
+//! to the UI thread to be freed there, so the audio thread never allocates or frees memory.
 
 use std::f32::consts::{FRAC_PI_4, SQRT_2, TAU};
 use std::sync::mpsc;
@@ -7,6 +11,10 @@ use std::sync::mpsc;
 /// Vinyl hiss and crackle fade in on play and out on stop over this many seconds,
 /// so a stopped engine is silent.
 const VINYL_FADE: f32 = 0.25;
+
+// ---------------------------------------------------------------------------------------------
+// v0.1 song. The UI still edits this and converts it with `Project::from` (roadmap week 2 moves
+// the UI onto `Project` and removes it).
 
 pub const STEPS: usize = 16;
 pub const BARS: usize = 4;
@@ -19,8 +27,6 @@ pub const BUSES: usize = 4;
 pub const BUS_NAMES: [&str; BUSES] = ["Drums", "Keys", "Bass", "Lead"];
 /// Mixer bus each channel feeds.
 pub const CH_BUS: [usize; CHANNELS] = [0, 0, 0, 1, 2, 3];
-/// Meters: one per bus, then master.
-pub const METERS: usize = BUSES + 1;
 
 /// Piano roll range: LEAD_LOW .. LEAD_LOW + LEAD_KEYS (C4..C6).
 pub const LEAD_LOW: u8 = 60;
@@ -45,6 +51,7 @@ pub const CHORDS: &[Chord] = &[
     Chord { name: "A7", bass: 45, notes: &[55, 61, 64, 67] },
 ];
 
+/// Master insert: the lo-fi chain, plus master volume.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Fx {
     pub tone: f32,
@@ -54,6 +61,9 @@ pub struct Fx {
     pub reverb: f32,
     pub volume: f32,
 }
+
+/// Master insert that leaves the sound (nearly) untouched.
+pub const FX_NEUTRAL: Fx = Fx { tone: 1.0, crush: 0.0, wobble: 0.0, vinyl: 0.0, reverb: 0.0, volume: 0.8 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Channel {
@@ -124,13 +134,91 @@ impl Default for Song {
     }
 }
 
-// Song goes by value (about 400 bytes) so the audio thread never frees heap memory.
-#[allow(clippy::large_enum_variant)]
+// ---------------------------------------------------------------------------------------------
+// Time and the snapshot the engine plays.
+
+pub type Tick = u32;
+/// Ticks per quarter note. Divides evenly into 16ths (24) and 8th-note triplets (32).
+pub const PPQ: Tick = 96;
+/// One 16th note: the step sequencer's grid.
+pub const STEP: Tick = PPQ / 4;
+
+/// Most channels and mixer tracks the engine plays; their state is allocated up front.
+pub const MAX_CHANNELS: usize = 64;
+pub const MAX_MIXER: usize = 16;
+/// Meter index of the master; meters `0..MAX_MIXER` are the mixer tracks.
+pub const MASTER: usize = MAX_MIXER;
+pub const METERS: usize = MAX_MIXER + 1;
+const VOICES: usize = 32;
+
+/// Built-in instruments.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Instrument {
+    Kick,
+    Snare,
+    Hat,
+    /// FM electric piano.
+    Rhodes,
+    /// Sine bass (one note at a time).
+    Bass,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ChannelMix {
+    pub instrument: Instrument,
+    /// Volume and pan as left/right gains.
+    pub gain: [f32; 2],
+    pub mute: bool,
+    /// Index into `Snapshot::mixer`.
+    pub mixer: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct MixerMix {
+    pub gain: [f32; 2],
+    pub mute: bool,
+}
+
+/// A note placed in song time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SeqNote {
+    pub start: Tick,
+    pub end: Tick,
+    /// Index into `Snapshot::channels`.
+    pub channel: u16,
+    pub pitch: u8,
+    /// 1..=127; 100 is the instrument's normal level.
+    pub vel: u8,
+}
+
+/// Everything the engine plays, with indices instead of IDs and every clip's notes placed in
+/// song time. Built on the UI thread by `Project::compile`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Snapshot {
+    pub bpm: f32,
+    pub swing: f32,
+    pub fx: Fx,
+    pub channels: Vec<ChannelMix>,
+    pub mixer: Vec<MixerMix>,
+    /// Sorted by start.
+    pub notes: Vec<SeqNote>,
+    /// Playback runs `loop_start..loop_end`, then wraps.
+    pub loop_start: Tick,
+    pub loop_end: Tick,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Snapshot { bpm: 120.0, swing: 0.5, fx: FX_NEUTRAL, channels: Vec::new(), mixer: Vec::new(), notes: Vec::new(), loop_start: 0, loop_end: 4 * PPQ }
+    }
+}
+
 pub enum Cmd {
-    Song(Song),
+    Snapshot(Box<Snapshot>),
     Play(bool),
-    NoteOn(u8),
-    NoteOff(u8),
+    /// Live notes (typing keyboard, piano-roll keys) on a channel index.
+    NoteOn { channel: u16, pitch: u8 },
+    NoteOff { channel: u16, pitch: u8 },
 }
 
 /// Most commands the UI can queue before the audio thread drains them.
@@ -143,14 +231,22 @@ pub fn command_channel() -> (mpsc::SyncSender<Cmd>, mpsc::Receiver<Cmd>) {
     mpsc::sync_channel(CMD_QUEUE)
 }
 
+/// Audio → UI queue of replaced snapshots, which the UI drops. Every snapshot arrives through the
+/// command queue, so this one has room for all of them.
+pub fn trash_channel() -> (mpsc::SyncSender<Box<Snapshot>>, mpsc::Receiver<Box<Snapshot>>) {
+    mpsc::sync_channel(CMD_QUEUE + 1)
+}
+
 pub fn midi_hz(n: u8) -> f32 {
     440.0 * 2f32.powf((n as f32 - 69.0) / 12.0)
 }
 
-/// Length in samples of a 16th step; odd steps are shortened by swing so each pair keeps its length.
-pub fn step_len(step: usize, bpm: f32, swing: f32, sr: f32) -> f64 {
+/// Length in samples of one tick. Swing lengthens the first 16th of each 8th-note pair and
+/// shortens the second, keeping the pair's length.
+pub fn tick_len(tick: Tick, bpm: f32, swing: f32, sr: f32) -> f64 {
     let pair = 2.0 * sr as f64 * 60.0 / bpm as f64 / 4.0;
-    if step.is_multiple_of(2) { pair * swing as f64 } else { pair * (1.0 - swing as f64) }
+    let share = f64::from(if tick % (2 * STEP) < STEP { swing } else { 1.0 - swing });
+    pair * share / STEP as f64
 }
 
 /// Constant-power pan, unity gain per side at center.
@@ -158,6 +254,9 @@ pub fn pan_gains(pan: f32) -> (f32, f32) {
     let a = (pan.clamp(-1.0, 1.0) + 1.0) * FRAC_PI_4;
     (a.cos() * SQRT_2, a.sin() * SQRT_2)
 }
+
+// ---------------------------------------------------------------------------------------------
+// Sound generators.
 
 struct Rng(u32);
 impl Rng {
@@ -170,20 +269,16 @@ impl Rng {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Default)]
-enum Kind {
-    #[default]
-    Chord,
-    Live,
-    Seq,
-}
-
 #[derive(Clone, Copy, Default)]
 struct Voice {
     active: bool,
     gate: bool,
-    kind: Kind,
+    /// Played from the keyboard; released by NoteOff, not by the sequencer.
+    live: bool,
+    channel: u16,
     note: u8,
+    /// Tick the sequencer releases it at.
+    end: Tick,
     freq: f32,
     vel: f32,
     t: f32,
@@ -212,6 +307,69 @@ impl Voice {
         self.mph = (self.mph + self.freq * dt).fract();
         self.tph = (self.tph + self.freq * 14.0 * dt).fract();
         self.t += dt;
+        out
+    }
+}
+
+/// Per-channel state for drums and the mono bass. Rhodes channels use the shared voice pool.
+#[derive(Clone, Copy)]
+struct ChanState {
+    /// Seconds since the last drum hit; 10 or more means silent.
+    hit_t: f32,
+    hit_vel: f32,
+    /// Oscillator phase (kick, bass).
+    ph: f32,
+    /// Hat noise low-pass state.
+    lp: f32,
+    // Mono bass.
+    note: u8,
+    freq: f32,
+    t: f32,
+    gate: bool,
+    live: bool,
+    amp: f32,
+    vel: f32,
+    end: Tick,
+}
+
+impl Default for ChanState {
+    fn default() -> Self {
+        ChanState { hit_t: 10.0, hit_vel: 1.0, ph: 0.0, lp: 0.0, note: 0, freq: 0.0, t: 0.0, gate: false, live: false, amp: 0.0, vel: 1.0, end: 0 }
+    }
+}
+
+impl ChanState {
+    fn render(&mut self, inst: Instrument, dt: f32, rel_coef: f32, rng: &mut Rng) -> f32 {
+        let t = self.hit_t;
+        let out = match inst {
+            Instrument::Kick if t < 0.6 => {
+                let f = 45.0 + 110.0 * (-t * 35.0).exp();
+                self.ph = (self.ph + f * dt).fract();
+                (TAU * self.ph).sin() * (-t * 7.0).exp() * 0.72 * self.hit_vel
+            }
+            Instrument::Snare if t < 0.4 => (rng.next() * 0.4 * (-t * 22.0).exp() + (TAU * 185.0 * t).sin() * 0.35 * (-t * 35.0).exp()) * 0.8 * self.hit_vel,
+            Instrument::Hat => {
+                let n = rng.next();
+                self.lp += 0.35 * (n - self.lp);
+                if t < 0.15 { (n - self.lp) * 0.18 * (-t * 70.0).exp() * self.hit_vel } else { 0.0 }
+            }
+            Instrument::Bass => {
+                if !self.gate {
+                    self.amp *= rel_coef;
+                }
+                if self.amp < 1e-4 {
+                    return 0.0;
+                }
+                let env = (self.t * 200.0).min(1.0) * (0.55 + 0.45 * (-self.t * 2.0).exp()) * self.amp;
+                self.ph = (self.ph + self.freq * dt).fract();
+                self.t += dt;
+                return ((TAU * self.ph).sin() * 1.6).tanh() * 0.35 * env * self.vel;
+            }
+            _ => 0.0,
+        };
+        if self.hit_t < 10.0 {
+            self.hit_t += dt;
+        }
         out
     }
 }
@@ -327,27 +485,30 @@ impl FxChain {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The engine.
+
 pub struct Engine {
     sr: f32,
     dt: f32,
-    song: Song,
+    snap: Box<Snapshot>,
+    /// Where replaced snapshots go to be freed; `None` drops them in place (offline rendering).
+    trash: Option<mpsc::SyncSender<Box<Snapshot>>>,
+    /// Snapshots the trash queue had no room for. They are leaked, not freed on this thread.
+    pub leaked: usize,
     pub playing: bool,
-    /// Global step (0..TOTAL_STEPS) most recently triggered.
-    pub step: usize,
-    next_step: usize,
+    /// Tick most recently reached while playing.
+    pub tick: Tick,
+    next_tick: Tick,
     to_next: f64,
+    /// Index of the first note not yet started.
+    cursor: usize,
+    /// Playback wrapped to the loop start; held notes are released before the next tick.
+    wrapped: bool,
     rng: Rng,
-    drum_t: [f32; TRACKS],
-    kick_ph: f32,
-    hat_lp: f32,
-    voices: [Voice; 32],
-    lead_held: [bool; LEAD_KEYS],
+    chans: [ChanState; MAX_CHANNELS],
+    voices: [Voice; VOICES],
     rel_coef: f32,
-    bass_freq: f32,
-    bass_t: f32,
-    bass_gate: bool,
-    bass_amp: f32,
-    bass_ph: f32,
     fx: [FxChain; 2],
     /// 0..1 gain on the vinyl noise: ramps to 1 while playing, to 0 when stopped.
     vinyl_amt: f32,
@@ -359,216 +520,216 @@ impl Engine {
         Engine {
             sr,
             dt: 1.0 / sr,
-            song: Song::default(),
+            snap: Box::new(Snapshot::default()),
+            trash: None,
+            leaked: 0,
             playing: false,
-            step: 0,
-            next_step: 0,
+            tick: 0,
+            next_tick: 0,
             to_next: 0.0,
+            cursor: 0,
+            wrapped: false,
             rng: Rng(0x1234_5678),
-            drum_t: [f32::MAX; TRACKS],
-            kick_ph: 0.0,
-            hat_lp: 0.0,
-            voices: [Voice::default(); 32],
-            lead_held: [false; LEAD_KEYS],
+            chans: [ChanState::default(); MAX_CHANNELS],
+            voices: [Voice::default(); VOICES],
             rel_coef: (-1.0 / (0.25 * sr)).exp(),
-            bass_freq: 0.0,
-            bass_t: 0.0,
-            bass_gate: false,
-            bass_amp: 0.0,
-            bass_ph: 0.0,
             fx: [FxChain::new(sr, 0, 0x9e37_79b9), FxChain::new(sr, 23, 0x7f4a_7c15)],
             vinyl_amt: 0.0,
             peaks: [0.0; METERS],
         }
     }
 
+    /// Live playback: replaced snapshots are sent to `trash` for the UI thread to free.
+    pub fn with_trash(mut self, trash: mpsc::SyncSender<Box<Snapshot>>) -> Self {
+        self.trash = Some(trash);
+        self
+    }
+
     pub fn handle(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Song(s) => self.song = s,
-            Cmd::Play(on) => {
-                self.playing = on;
-                self.next_step = 0;
-                self.to_next = 0.0;
-                if !on {
-                    self.release(Kind::Chord);
-                    self.release(Kind::Seq);
-                    self.bass_gate = false;
-                    self.lead_held = [false; LEAD_KEYS];
+            Cmd::Snapshot(s) => {
+                let old = std::mem::replace(&mut self.snap, s);
+                self.retire(old);
+                let n = self.snap.channels.len();
+                for v in self.voices.iter_mut().filter(|v| v.channel as usize >= n) {
+                    v.gate = false;
+                }
+                if self.playing {
+                    if !(self.snap.loop_start..self.snap.loop_end).contains(&self.next_tick) {
+                        self.next_tick = self.snap.loop_start;
+                        self.wrapped = true;
+                    }
+                    self.seek(self.next_tick);
                 }
             }
-            Cmd::NoteOn(n) => self.note_on(n, 0.3, Kind::Live),
-            Cmd::NoteOff(n) => self.note_off(n, Kind::Live),
+            Cmd::Play(on) => {
+                self.playing = on;
+                self.next_tick = self.snap.loop_start;
+                self.to_next = 0.0;
+                self.wrapped = false;
+                self.seek(self.next_tick);
+                self.release_seq();
+            }
+            Cmd::NoteOn { channel, pitch } => self.note_on(channel, pitch, 100, Tick::MAX, true),
+            Cmd::NoteOff { channel, pitch } => {
+                for v in self.voices.iter_mut().filter(|v| v.live && v.channel == channel && v.note == pitch) {
+                    v.gate = false;
+                }
+                if let Some(c) = self.chans.get_mut(channel as usize).filter(|c| c.live && c.note == pitch) {
+                    c.gate = false;
+                }
+            }
         }
     }
 
-    /// Peak level per meter since the last call, then reset.
+    /// Peak level per meter since the last call, then reset. Index `MASTER` is the master.
     pub fn take_peaks(&mut self) -> [f32; METERS] {
         std::mem::take(&mut self.peaks)
     }
 
-    fn note_on(&mut self, note: u8, vel: f32, kind: Kind) {
-        // Free voice first, otherwise steal the oldest.
-        let i = self.voices.iter().position(|v| !v.active).unwrap_or_else(|| {
-            let mut best = 0;
-            for (i, v) in self.voices.iter().enumerate() {
-                if v.t > self.voices[best].t {
-                    best = i;
-                }
-            }
-            best
-        });
-        self.voices[i] = Voice { active: true, gate: true, kind, note, freq: midi_hz(note), vel, rel: 1.0, ..Voice::default() };
+    fn retire(&mut self, old: Box<Snapshot>) {
+        let Some(tx) = &self.trash else { return drop(old) };
+        if let Err(mpsc::TrySendError::Full(old) | mpsc::TrySendError::Disconnected(old)) = tx.try_send(old) {
+            std::mem::forget(old);
+            self.leaked += 1;
+        }
     }
 
-    fn note_off(&mut self, note: u8, kind: Kind) {
-        for v in self.voices.iter_mut().filter(|v| v.kind == kind && v.note == note) {
+    fn seek(&mut self, t: Tick) {
+        self.cursor = self.snap.notes.partition_point(|n| n.start < t);
+    }
+
+    /// Releases every note the sequencer started.
+    fn release_seq(&mut self) {
+        for v in self.voices.iter_mut().filter(|v| !v.live) {
             v.gate = false;
         }
+        for c in self.chans.iter_mut().filter(|c| !c.live) {
+            c.gate = false;
+        }
     }
 
-    fn release(&mut self, kind: Kind) {
-        for v in self.voices.iter_mut().filter(|v| v.kind == kind) {
+    fn note_on(&mut self, channel: u16, pitch: u8, vel: u8, end: Tick, live: bool) {
+        let ch = channel as usize;
+        let (Some(mix), Some(st)) = (self.snap.channels.get(ch), self.chans.get_mut(ch)) else { return };
+        let g = vel as f32 / 100.0;
+        match mix.instrument {
+            Instrument::Kick | Instrument::Snare | Instrument::Hat => {
+                st.hit_t = 0.0;
+                st.hit_vel = g;
+            }
+            Instrument::Bass => *st = ChanState { note: pitch, freq: midi_hz(pitch), t: 0.0, gate: true, live, amp: 1.0, vel: g, end, ..*st },
+            Instrument::Rhodes => {
+                // Free voice first, otherwise steal the oldest.
+                let i = self.voices.iter().position(|v| !v.active).unwrap_or_else(|| {
+                    let mut best = 0;
+                    for (i, v) in self.voices.iter().enumerate() {
+                        if v.t > self.voices[best].t {
+                            best = i;
+                        }
+                    }
+                    best
+                });
+                self.voices[i] = Voice { active: true, gate: true, live, channel, note: pitch, end, freq: midi_hz(pitch), vel: 0.3 * g, rel: 1.0, ..Voice::default() };
+            }
+        }
+    }
+
+    /// Ends notes due at tick `t`, then starts the notes that begin there.
+    fn fire_tick(&mut self, t: Tick) {
+        if self.wrapped {
+            self.wrapped = false;
+            self.release_seq();
+            self.seek(t);
+        }
+        for v in self.voices.iter_mut().filter(|v| v.gate && !v.live && v.end <= t) {
             v.gate = false;
         }
-    }
-
-    fn trigger(&mut self, step: usize) {
-        let (s, bar) = (step % STEPS, step / STEPS);
-        if self.song.drum_bars[bar] {
-            for tr in 0..TRACKS {
-                if self.song.drums[tr][s] {
-                    self.drum_t[tr] = 0.0;
-                }
+        for c in self.chans.iter_mut().filter(|c| c.gate && !c.live && c.end <= t) {
+            c.gate = false;
+        }
+        while let Some(&n) = self.snap.notes.get(self.cursor) {
+            if n.start > t {
+                break;
+            }
+            self.cursor += 1;
+            if n.start == t {
+                self.note_on(n.channel, n.pitch, n.vel, n.end, false);
             }
         }
-        if s == 0 {
-            self.release(Kind::Chord);
-            self.bass_gate = false;
-            let c = &CHORDS[self.song.chords[bar].min(CHORDS.len() - 1)];
-            for &n in c.notes {
-                self.note_on(n, 0.16, Kind::Chord);
-            }
-            if c.bass > 0 {
-                self.bass_freq = midi_hz(c.bass);
-                self.bass_t = 0.0;
-                self.bass_gate = true;
-                self.bass_amp = 1.0;
-            }
-        }
-        for k in 0..LEAD_KEYS {
-            let pitch = LEAD_LOW + k as u8;
-            let now = self.song.lead_bars[bar] && self.song.note(pitch, step);
-            if now && !self.lead_held[k] {
-                self.note_on(pitch, 0.3, Kind::Seq);
-            } else if !now && self.lead_held[k] {
-                self.note_off(pitch, Kind::Seq);
-            }
-            self.lead_held[k] = now;
-        }
-    }
-
-    fn drums(&mut self) -> [f32; TRACKS] {
-        let dt = self.dt;
-        let mut out = [0.0; TRACKS];
-        let t = self.drum_t[0];
-        if t < 0.6 {
-            let f = 45.0 + 110.0 * (-t * 35.0).exp();
-            self.kick_ph = (self.kick_ph + f * dt).fract();
-            out[0] = (TAU * self.kick_ph).sin() * (-t * 7.0).exp() * 0.72;
-        }
-        let t = self.drum_t[1];
-        if t < 0.4 {
-            out[1] = (self.rng.next() * 0.4 * (-t * 22.0).exp() + (TAU * 185.0 * t).sin() * 0.35 * (-t * 35.0).exp()) * 0.8;
-        }
-        let t = self.drum_t[2];
-        let n = self.rng.next();
-        self.hat_lp += 0.35 * (n - self.hat_lp);
-        if t < 0.15 {
-            out[2] = (n - self.hat_lp) * 0.18 * (-t * 70.0).exp();
-        }
-        for t in &mut self.drum_t {
-            if *t < 10.0 {
-                *t += dt;
-            }
-        }
-        out
-    }
-
-    fn bass(&mut self) -> f32 {
-        if !self.bass_gate {
-            self.bass_amp *= self.rel_coef;
-        }
-        if self.bass_amp < 1e-4 {
-            return 0.0;
-        }
-        let env = (self.bass_t * 200.0).min(1.0) * (0.55 + 0.45 * (-self.bass_t * 2.0).exp()) * self.bass_amp;
-        self.bass_ph = (self.bass_ph + self.bass_freq * self.dt).fract();
-        self.bass_t += self.dt;
-        ((TAU * self.bass_ph).sin() * 1.6).tanh() * 0.35 * env
     }
 
     /// One stereo frame.
     pub fn next_frame(&mut self) -> [f32; 2] {
         if self.playing {
-            if self.to_next <= 0.0 {
-                self.step = self.next_step;
-                self.trigger(self.step);
-                self.to_next += step_len(self.step, self.song.bpm, self.song.swing, self.sr);
-                self.next_step = (self.step + 1) % TOTAL_STEPS;
+            while self.to_next <= 0.0 {
+                let t = self.next_tick;
+                self.tick = t;
+                self.fire_tick(t);
+                self.to_next += tick_len(t, self.snap.bpm, self.snap.swing, self.sr);
+                self.next_tick = t + 1;
+                if self.next_tick >= self.snap.loop_end {
+                    self.next_tick = self.snap.loop_start;
+                    self.wrapped = true;
+                }
             }
             self.to_next -= 1.0;
         }
-        let mut ch = [0.0; CHANNELS];
-        ch[..TRACKS].copy_from_slice(&self.drums());
+
         let (dt, rc) = (self.dt, self.rel_coef);
+        let n = self.snap.channels.len().min(MAX_CHANNELS);
+        let mut ch = [0.0f32; MAX_CHANNELS];
+        for (i, out) in ch.iter_mut().enumerate().take(n) {
+            *out = self.chans[i].render(self.snap.channels[i].instrument, dt, rc, &mut self.rng);
+        }
         for v in self.voices.iter_mut().filter(|v| v.active) {
             let out = v.tick(dt, rc);
-            ch[if v.kind == Kind::Chord { 3 } else { 5 }] += out;
-        }
-        ch[4] = self.bass();
-
-        let mut bus = [[0.0f32; 2]; BUSES];
-        for (i, &x) in ch.iter().enumerate() {
-            let c = self.song.channels[i];
-            if !c.mute {
-                let (l, r) = pan_gains(c.pan);
-                bus[CH_BUS[i]][0] += x * c.vol * l;
-                bus[CH_BUS[i]][1] += x * c.vol * r;
+            if let Some(c) = ch.get_mut(v.channel as usize) {
+                *c += out;
             }
         }
+
+        let mut bus = [[0.0f32; 2]; MAX_MIXER];
+        for (c, &x) in self.snap.channels.iter().zip(&ch).filter(|(c, _)| !c.mute) {
+            let b = &mut bus[c.mixer.min(MAX_MIXER - 1)];
+            b[0] += x * c.gain[0];
+            b[1] += x * c.gain[1];
+        }
         let mut mix = [0.0; 2];
-        for (b, [l, r]) in bus.into_iter().enumerate() {
-            let (l, r) = (l * self.song.bus[b], r * self.song.bus[b]);
-            self.peaks[b] = self.peaks[b].max(l.abs()).max(r.abs());
+        for (m, (mx, [l, r])) in self.snap.mixer.iter().zip(bus).enumerate().filter(|(_, (mx, _))| !mx.mute) {
+            let (l, r) = (l * mx.gain[0], r * mx.gain[1]);
+            self.peaks[m] = self.peaks[m].max(l.abs()).max(r.abs());
             mix[0] += l;
             mix[1] += r;
         }
+
         let ramp = self.dt / VINYL_FADE;
         self.vinyl_amt = if self.playing { (self.vinyl_amt + ramp).min(1.0) } else { (self.vinyl_amt - ramp).max(0.0) };
-        let fx = Fx { vinyl: self.song.fx.vinyl * self.vinyl_amt, ..self.song.fx };
+        let fx = Fx { vinyl: self.snap.fx.vinyl * self.vinyl_amt, ..self.snap.fx };
         let out = [self.fx[0].process(mix[0], &fx, self.sr), self.fx[1].process(mix[1], &fx, self.sr)];
-        self.peaks[BUSES] = self.peaks[BUSES].max(out[0].abs()).max(out[1].abs());
+        self.peaks[MASTER] = self.peaks[MASTER].max(out[0].abs()).max(out[1].abs());
         out
     }
 }
 
-/// Render `loops` passes of the 4-bar song plus a 2 s tail, stereo.
-pub fn render_offline(song: Song, sr: u32, loops: usize) -> Vec<[f32; 2]> {
+/// Render `loops` passes of the loop range plus a 2 s tail, stereo.
+pub fn render_offline(snap: &Snapshot, sr: u32, loops: usize) -> Vec<[f32; 2]> {
     let mut e = Engine::new(sr as f32);
-    e.handle(Cmd::Song(song));
+    e.handle(Cmd::Snapshot(Box::new(snap.clone())));
     e.handle(Cmd::Play(true));
-    let body = (loops * BARS) as f64 * 4.0 * 60.0 / song.bpm as f64 * sr as f64;
+    let beats = (snap.loop_end - snap.loop_start) as f64 / PPQ as f64;
+    let body = loops as f64 * beats * 60.0 / snap.bpm as f64 * sr as f64;
     let mut out: Vec<[f32; 2]> = (0..body as usize).map(|_| e.next_frame()).collect();
     e.handle(Cmd::Play(false));
     out.extend((0..sr as usize * 2).map(|_| e.next_frame()));
     out
 }
 
-pub fn export_wav(path: &std::path::Path, song: Song) -> Result<(), hound::Error> {
+pub fn export_wav(path: &std::path::Path, snap: &Snapshot) -> Result<(), hound::Error> {
     let sr = 44100;
     let spec = hound::WavSpec { channels: 2, sample_rate: sr, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
     let mut w = hound::WavWriter::create(path, spec)?;
-    for frame in render_offline(song, sr, 2) {
+    for frame in render_offline(snap, sr, 2) {
         for s in frame {
             w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
         }
@@ -579,41 +740,33 @@ pub fn export_wav(path: &std::path::Path, song: Song) -> Result<(), hound::Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::project::Project;
+    use crate::rt;
 
-    /// Counts allocations and frees made by threads that set `WATCH` (other tests are unaffected).
-    struct CountingAlloc;
-    static HEAP_OPS: AtomicUsize = AtomicUsize::new(0);
-    thread_local! { static WATCH: Cell<bool> = const { Cell::new(false) }; }
+    const UNITY: [f32; 2] = [1.0, 1.0];
 
-    unsafe impl GlobalAlloc for CountingAlloc {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            if WATCH.with(Cell::get) {
-                HEAP_OPS.fetch_add(1, Ordering::Relaxed);
-            }
-            unsafe { System.alloc(l) }
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            if WATCH.with(Cell::get) {
-                HEAP_OPS.fetch_add(1, Ordering::Relaxed);
-            }
-            unsafe { System.dealloc(p, l) }
+    /// The demo song as the engine plays it.
+    fn demo() -> Snapshot {
+        Project::from(&Song::default()).compile()
+    }
+
+    /// One mixer track, the given channels, these notes, a 1-bar loop.
+    fn snap(instruments: &[Instrument], notes: &[SeqNote]) -> Snapshot {
+        Snapshot {
+            channels: instruments.iter().map(|&instrument| ChannelMix { instrument, gain: UNITY, mute: false, mixer: 0 }).collect(),
+            mixer: vec![MixerMix { gain: UNITY, mute: false }],
+            notes: notes.to_vec(),
+            ..Snapshot::default()
         }
     }
 
-    #[global_allocator]
-    static ALLOC: CountingAlloc = CountingAlloc;
-
-    fn silent() -> Song {
-        let d = Song::default();
-        Song { drums: [[false; STEPS]; TRACKS], chords: [0; BARS], melody: [0; LEAD_KEYS], fx: Fx { vinyl: 0.0, ..d.fx }, ..d }
+    fn note(channel: u16, pitch: u8, start: Tick, len: Tick) -> SeqNote {
+        SeqNote { start, end: start + len, channel, pitch, vel: 100 }
     }
 
-    fn engine(song: Song, sr: f32) -> Engine {
+    fn engine(s: &Snapshot, sr: f32) -> Engine {
         let mut e = Engine::new(sr);
-        e.handle(Cmd::Song(song));
+        e.handle(Cmd::Snapshot(Box::new(s.clone())));
         e.handle(Cmd::Play(true));
         e
     }
@@ -627,13 +780,18 @@ mod tests {
         p
     }
 
+    /// Frames until the output first exceeds `level`.
+    fn onset(e: &mut Engine, level: f32, max: usize) -> Option<usize> {
+        (0..max).find(|_| e.next_frame()[0].abs() > level)
+    }
+
     #[test]
     fn swing_keeps_pair_length() {
-        let (a, b) = (step_len(0, 90.0, 0.66, 48000.0), step_len(1, 90.0, 0.66, 48000.0));
+        let len = |range: std::ops::Range<Tick>, swing| range.map(|t| tick_len(t, 90.0, swing, 48000.0)).sum::<f64>();
         let pair = 2.0 * 48000.0 * 60.0 / 90.0 / 4.0;
-        assert!((a + b - pair).abs() < 1e-6);
-        assert!(a > b);
-        assert_eq!(step_len(0, 90.0, 0.5, 48000.0), step_len(1, 90.0, 0.5, 48000.0));
+        assert!((len(0..2 * STEP, 0.66) - pair).abs() < 1e-6);
+        assert!((len(0..STEP, 0.66) - pair * f64::from(0.66f32)).abs() < 1e-6);
+        assert!((len(0..STEP, 0.5) - len(STEP..2 * STEP, 0.5)).abs() < 1e-9);
     }
 
     #[test]
@@ -654,8 +812,8 @@ mod tests {
     }
 
     #[test]
-    fn default_song_renders_audible_and_bounded() {
-        let out = render_offline(Song::default(), 22050, 1);
+    fn demo_renders_audible_and_bounded() {
+        let out = render_offline(&demo(), 22050, 1);
         let expected = (BARS as f64 * 4.0 * 60.0 / 80.0 * 22050.0) as usize + 44100;
         assert_eq!(out.len(), expected);
         let peak = out.iter().flatten().fold(0f32, |m, s| m.max(s.abs()));
@@ -664,63 +822,106 @@ mod tests {
     }
 
     #[test]
-    fn empty_song_is_silent() {
-        let out = render_offline(silent(), 22050, 1);
+    fn empty_snapshot_is_silent() {
+        let out = render_offline(&Snapshot::default(), 22050, 1);
+        assert!(out.iter().flatten().all(|s| s.abs() < 1e-3));
+        let out = render_offline(&snap(&[Instrument::Kick, Instrument::Rhodes, Instrument::Bass], &[]), 22050, 1);
         assert!(out.iter().flatten().all(|s| s.abs() < 1e-3));
     }
 
     #[test]
-    fn kick_on_step_zero_sounds_immediately() {
-        let mut s = silent();
-        s.drums[0][0] = true;
-        assert!(peak(&mut engine(s, 22050.0), 2205)[0] > 0.1);
+    fn kick_on_tick_zero_sounds_immediately() {
+        let s = snap(&[Instrument::Kick], &[note(0, 60, 0, STEP)]);
+        assert!(peak(&mut engine(&s, 22050.0), 2205)[0] > 0.1);
+    }
+
+    /// Notes start on time: a hit on beat 2 starts one beat after a hit on beat 1; with swing,
+    /// the second 16th starts `swing` of the way through the 8th-note pair. (Onsets are compared
+    /// with a hit on tick 0 because the master chain's wow delay shifts everything a little.)
+    #[test]
+    fn notes_start_on_time_with_swing() {
+        let sr = 22050.0;
+        let at = |s: &Snapshot, start: Tick| {
+            let mut s = s.clone();
+            s.notes = vec![note(0, 60, start, STEP)];
+            onset(&mut engine(&s, sr), 1e-3, 30000).unwrap() as f64
+        };
+        let mut s = snap(&[Instrument::Kick], &[]);
+        let beat = 60.0 / s.bpm as f64 * sr as f64;
+        let got = at(&s, PPQ) - at(&s, 0);
+        assert!((got - beat).abs() <= 1.0, "beat 2 at {got}, want {beat}");
+
+        s.swing = 0.66;
+        let want = 2.0 * sr as f64 * 60.0 / s.bpm as f64 / 4.0 * 0.66;
+        let got = at(&s, STEP) - at(&s, 0);
+        assert!((got - want).abs() <= 1.0, "swung 16th at {got}, want {want}");
     }
 
     #[test]
-    fn mute_pan_and_drum_bars() {
-        let mut s = silent();
-        s.drums[0][0] = true;
-        s.channels[0].pan = -1.0;
-        let p = peak(&mut engine(s, 22050.0), 2205);
+    fn note_end_releases_voice() {
+        let s = snap(&[Instrument::Rhodes, Instrument::Bass], &[note(0, 60, 0, STEP), note(1, 36, 0, STEP)]);
+        let mut e = engine(&s, 22050.0);
+        peak(&mut e, 100);
+        assert!(e.voices.iter().any(|v| v.active && v.gate) && e.chans[1].gate);
+        // A 16th at 120 BPM is 0.125 s; well after it the gates are closed.
+        peak(&mut e, 22050 / 4);
+        assert!(e.voices.iter().all(|v| !v.gate) && !e.chans[1].gate);
+    }
+
+    #[test]
+    fn mute_pan_and_mixer() {
+        let mut s = snap(&[Instrument::Kick], &[note(0, 60, 0, STEP)]);
+        let (l, r) = pan_gains(-1.0);
+        s.channels[0].gain = [l, r];
+        let p = peak(&mut engine(&s, 22050.0), 2205);
         assert!(p[0] > 0.1 && p[1] < 1e-3, "{p:?}");
         s.channels[0].mute = true;
-        assert!(peak(&mut engine(s, 22050.0), 2205)[0] < 1e-3);
+        assert!(peak(&mut engine(&s, 22050.0), 2205)[0] < 1e-3);
         s.channels[0].mute = false;
-        s.drum_bars[0] = false;
-        assert!(peak(&mut engine(s, 22050.0), 2205)[0] < 1e-3);
+        s.mixer[0].mute = true;
+        assert!(peak(&mut engine(&s, 22050.0), 2205)[0] < 1e-3);
+        s.mixer[0] = MixerMix { gain: [0.0, 0.0], mute: false };
+        assert!(peak(&mut engine(&s, 22050.0), 2205)[0] < 1e-3);
     }
 
     #[test]
-    fn melody_plays_on_lead_bus_and_respects_lead_bars() {
-        let mut s = silent();
-        s.set_note(72, 0, true);
-        s.set_note(72, 1, true);
-        assert!(s.note(72, 1) && !s.note(72, 2) && !s.note(40, 0));
-        let mut e = engine(s, 22050.0);
+    fn meters_follow_mixer_routing() {
+        let mut s = snap(&[Instrument::Kick, Instrument::Rhodes], &[note(1, 72, 0, 2 * STEP)]);
+        s.mixer.push(MixerMix { gain: UNITY, mute: false });
+        s.channels[1].mixer = 1;
+        let mut e = engine(&s, 22050.0);
         assert!(peak(&mut e, 2205)[0] > 0.05);
-        let meters = e.take_peaks();
-        assert!(meters[3] > 0.05 && meters[0] == 0.0 && meters[BUSES] > 0.05, "{meters:?}");
+        let m = e.take_peaks();
+        assert!(m[1] > 0.05 && m[0] == 0.0 && m[MASTER] > 0.05, "{m:?}");
         assert_eq!(e.take_peaks(), [0.0; METERS]);
-        s.lead_bars[0] = false;
-        assert!(peak(&mut engine(s, 22050.0), 2205)[0] < 1e-3);
     }
 
     #[test]
-    fn live_note_on_off_releases() {
+    fn live_notes_play_and_release() {
+        let s = snap(&[Instrument::Rhodes, Instrument::Kick, Instrument::Bass], &[]);
         let mut e = Engine::new(22050.0);
-        e.handle(Cmd::Song(silent()));
-        e.handle(Cmd::NoteOn(60));
-        let on = peak(&mut e, 2205)[0];
-        e.handle(Cmd::NoteOff(60));
+        e.handle(Cmd::Snapshot(Box::new(s)));
+        e.handle(Cmd::NoteOn { channel: 0, pitch: 60 });
+        assert!(peak(&mut e, 2205)[0] > 0.05);
+        e.handle(Cmd::NoteOff { channel: 0, pitch: 60 });
         peak(&mut e, 22050 * 3);
-        assert!(on > 0.05);
         assert!(e.voices.iter().all(|v| !v.active));
+        e.handle(Cmd::NoteOn { channel: 1, pitch: 60 });
+        assert!(peak(&mut e, 2205)[0] > 0.1);
+        e.handle(Cmd::NoteOn { channel: 2, pitch: 36 });
+        assert!(peak(&mut e, 2205)[0] > 0.05);
+        e.handle(Cmd::NoteOff { channel: 2, pitch: 36 });
+        peak(&mut e, 22050 * 3);
+        assert!(peak(&mut e, 100)[0] < 1e-3);
+        // Out-of-range channels are ignored.
+        e.handle(Cmd::NoteOn { channel: 999, pitch: 60 });
+        assert!(peak(&mut e, 100)[0] < 1e-3);
     }
 
     #[test]
     fn export_writes_readable_stereo_wav() {
         let path = std::env::temp_dir().join(format!("ritmo-test-{}.wav", std::process::id()));
-        export_wav(&path, Song::default()).unwrap();
+        export_wav(&path, &demo()).unwrap();
         let r = hound::WavReader::open(&path).unwrap();
         let spec = r.spec();
         let frames = r.len() / 2;
@@ -730,16 +931,86 @@ mod tests {
         assert_eq!(frames as usize, (24.0 * 44100.0) as usize + 88200);
     }
 
-    /// The audio callback's work (drain commands, render frames) must not touch the heap.
+    #[test]
+    fn sequencer_wraps_at_loop_end() {
+        let mut s = snap(&[], &[]);
+        s.bpm = 160.0;
+        s.loop_end = 4 * 4 * PPQ;
+        let mut e = engine(&s, 8000.0);
+        let total = (4.0 * 4.0 * 60.0 / 160.0 * 8000.0) as usize;
+        let mut max = 0;
+        for _ in 0..total + 10 {
+            e.next_frame();
+            max = max.max(e.tick);
+        }
+        assert_eq!(max, s.loop_end - 1);
+        assert_eq!(e.tick, 0);
+    }
+
+    #[test]
+    fn loop_range_and_held_notes_at_wrap() {
+        let mut s = snap(&[Instrument::Rhodes], &[note(0, 60, 0, 8 * PPQ)]);
+        (s.loop_start, s.loop_end) = (4 * PPQ, 8 * PPQ);
+        s.bpm = 240.0;
+        let mut e = engine(&s, 8000.0);
+        let mut ticks = Vec::new();
+        for _ in 0..8000 * 3 {
+            e.next_frame();
+            ticks.push(e.tick);
+        }
+        assert!(ticks.iter().all(|t| (4 * PPQ..8 * PPQ).contains(t)));
+        assert!(ticks.windows(2).any(|w| w[1] < w[0]), "never wrapped");
+        // The note starts before the loop, so it never plays.
+        assert!(e.voices.iter().all(|v| !v.active));
+    }
+
+    #[test]
+    fn new_snapshot_keeps_position_and_frees_on_ui_thread() {
+        let (tx, rx) = trash_channel();
+        let s = demo();
+        let mut e = Engine::new(22050.0).with_trash(tx);
+        e.handle(Cmd::Snapshot(Box::new(s.clone())));
+        e.handle(Cmd::Play(true));
+        peak(&mut e, 22050);
+        let at = e.tick;
+        assert!(at > 0);
+        let mut s2 = s.clone();
+        s2.notes.clear();
+        e.handle(Cmd::Snapshot(Box::new(s2)));
+        e.next_frame();
+        assert!(e.tick >= at && e.tick <= at + 1, "{} vs {at}", e.tick);
+        // The initial empty snapshot and the demo came back to be freed here.
+        assert_eq!(rx.try_iter().count(), 2);
+        assert_eq!(e.leaked, 0);
+        // With no notes left, the voices ring out and the song goes quiet (vinyl aside).
+        let mut s3 = s.clone();
+        s3.notes.clear();
+        s3.fx.vinyl = 0.0;
+        e.handle(Cmd::Snapshot(Box::new(s3)));
+        peak(&mut e, 22050 * 5);
+        assert!(peak(&mut e, 22050)[0] < 1e-3);
+    }
+
+    #[test]
+    fn full_trash_leaks_instead_of_freeing() {
+        let (tx, _rx) = mpsc::sync_channel(0);
+        let mut e = Engine::new(8000.0).with_trash(tx);
+        e.handle(Cmd::Snapshot(Box::default()));
+        assert_eq!(e.leaked, 1);
+    }
+
+    /// The audio callback's work (drain commands, swap snapshots, render) must not touch the heap.
     #[test]
     fn audio_path_never_allocates_or_frees() {
-        const SONGS: usize = 300;
+        const SNAPS: usize = 200;
         let (tx, rx) = command_channel();
-        let mut e = Engine::new(22050.0);
-        // Like the app's UI thread: try_send, never a blocking send (a blocked sender
-        // registers a wakeup that the receiver may then touch).
+        let (trash_tx, trash_rx) = trash_channel();
+        let base = demo();
+        let mut e = Engine::new(22050.0).with_trash(trash_tx);
+        // Like the app's UI thread: build snapshots, try_send them, free what comes back.
         let ui = std::thread::spawn(move || {
             let send = |mut cmd: Cmd| loop {
+                while trash_rx.try_recv().is_ok() {}
                 match tx.try_send(cmd) {
                     Ok(()) => break,
                     Err(mpsc::TrySendError::Full(c)) => {
@@ -750,15 +1021,22 @@ mod tests {
                 }
             };
             send(Cmd::Play(true));
-            for i in 0..SONGS {
-                send(Cmd::Song(Song { bpm: 80.0 + i as f32 * 0.1, ..Song::default() }));
-                send(Cmd::NoteOn(60 + (i % 12) as u8));
-                send(Cmd::NoteOff(60 + (i % 12) as u8));
+            for i in 0..SNAPS {
+                let mut s = base.clone();
+                s.bpm = 80.0 + i as f32 * 0.1;
+                if i % 2 == 0 {
+                    s.notes.truncate(i % s.notes.len());
+                }
+                send(Cmd::Snapshot(Box::new(s)));
+                send(Cmd::NoteOn { channel: 5, pitch: 60 + (i % 12) as u8 });
+                send(Cmd::NoteOff { channel: 5, pitch: 60 + (i % 12) as u8 });
             }
+            trash_rx
         });
-        let total = 1 + SONGS * 3;
+        let total = 1 + SNAPS * 3;
         let mut got = 0;
-        WATCH.with(|w| w.set(true));
+        let before = rt::violations();
+        rt::enter();
         while got < total {
             while let Ok(cmd) = rx.try_recv() {
                 e.handle(cmd);
@@ -769,23 +1047,24 @@ mod tests {
             }
             e.take_peaks();
         }
-        WATCH.with(|w| w.set(false));
-        ui.join().unwrap();
-        assert_eq!(HEAP_OPS.load(Ordering::Relaxed), 0, "audio path allocated or freed memory (got {got} cmds)");
-        assert!(e.playing && (e.song.bpm - (80.0 + (SONGS - 1) as f32 * 0.1)).abs() < 1e-4);
+        rt::exit();
+        drop(ui.join().unwrap());
+        assert_eq!(rt::violations() - before, 0, "audio path allocated or freed memory");
+        assert_eq!(e.leaked, 0);
+        assert!(e.playing && (e.snap.bpm - (80.0 + (SNAPS - 1) as f32 * 0.1)).abs() < 1e-4);
     }
 
     #[test]
     fn vinyl_crackles_while_playing() {
-        let mut s = silent();
+        let mut s = snap(&[], &[]);
         s.fx.vinyl = 1.0;
-        assert!(peak(&mut engine(s, 22050.0), 22050 * 2)[0] > 0.01);
+        assert!(peak(&mut engine(&s, 22050.0), 22050 * 2)[0] > 0.01);
     }
 
     #[test]
     fn stopped_engine_goes_silent() {
-        // Default song: vinyl on, chords, reverb. Play one bar, stop, let tails ring out.
-        let mut e = engine(Song::default(), 22050.0);
+        // Demo song: vinyl on, chords, reverb. Play a while, stop, let tails ring out.
+        let mut e = engine(&demo(), 22050.0);
         peak(&mut e, 22050 * 3);
         e.handle(Cmd::Play(false));
         peak(&mut e, 22050 * 3);
@@ -796,20 +1075,5 @@ mod tests {
         assert!(e.take_peaks().iter().all(|&m| m < 1e-3));
         // A fresh engine that never played is silent too.
         assert!(peak(&mut Engine::new(22050.0), 22050)[0] < 1e-3);
-    }
-
-    #[test]
-    fn sequencer_wraps_after_four_bars() {
-        let mut s = silent();
-        s.bpm = 160.0;
-        let mut e = engine(s, 8000.0);
-        let total = (BARS as f64 * 4.0 * 60.0 / 160.0 * 8000.0) as usize;
-        let mut max = 0;
-        for _ in 0..total + 10 {
-            e.next_frame();
-            max = max.max(e.step);
-        }
-        assert_eq!(max, TOTAL_STEPS - 1);
-        assert_eq!(e.step, 0);
     }
 }
