@@ -23,4 +23,6 @@ Knobs: drag up/down, scroll, or use the arrow keys; double-click resets.
 - **Space** = play/stop. **F5 / F6 / F7 / F9** = Playlist / Channel Rack / Piano Roll / Mixer.
 - **Export** writes `~/Music/ritmo-export.wav` (2 loops plus a 2 s tail).
 
-Linux needs the ALSA dev package (`alsa-lib` on Arch).
+Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian/Ubuntu).
+
+MIT licensed; see `LICENSE`.

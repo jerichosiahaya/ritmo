@@ -2,6 +2,11 @@
 //! Pure Rust and no I/O, so the same engine plays live and renders WAV exports.
 
 use std::f32::consts::{FRAC_PI_4, SQRT_2, TAU};
+use std::sync::mpsc;
+
+/// Vinyl hiss and crackle fade in on play and out on stop over this many seconds,
+/// so a stopped engine is silent.
+const VINYL_FADE: f32 = 0.25;
 
 pub const STEPS: usize = 16;
 pub const BARS: usize = 4;
@@ -126,6 +131,16 @@ pub enum Cmd {
     Play(bool),
     NoteOn(u8),
     NoteOff(u8),
+}
+
+/// Most commands the UI can queue before the audio thread drains them.
+pub const CMD_QUEUE: usize = 256;
+
+/// UI → audio command queue. It is bounded, so its buffer is allocated once here and
+/// receiving never allocates or frees (an unbounded `mpsc::channel` frees its blocks on the
+/// receiving side). Send with `try_send` so the UI never blocks.
+pub fn command_channel() -> (mpsc::SyncSender<Cmd>, mpsc::Receiver<Cmd>) {
+    mpsc::sync_channel(CMD_QUEUE)
 }
 
 pub fn midi_hz(n: u8) -> f32 {
@@ -334,6 +349,8 @@ pub struct Engine {
     bass_amp: f32,
     bass_ph: f32,
     fx: [FxChain; 2],
+    /// 0..1 gain on the vinyl noise: ramps to 1 while playing, to 0 when stopped.
+    vinyl_amt: f32,
     peaks: [f32; METERS],
 }
 
@@ -360,6 +377,7 @@ impl Engine {
             bass_amp: 0.0,
             bass_ph: 0.0,
             fx: [FxChain::new(sr, 0, 0x9e37_79b9), FxChain::new(sr, 23, 0x7f4a_7c15)],
+            vinyl_amt: 0.0,
             peaks: [0.0; METERS],
         }
     }
@@ -525,7 +543,10 @@ impl Engine {
             mix[0] += l;
             mix[1] += r;
         }
-        let out = [self.fx[0].process(mix[0], &self.song.fx, self.sr), self.fx[1].process(mix[1], &self.song.fx, self.sr)];
+        let ramp = self.dt / VINYL_FADE;
+        self.vinyl_amt = if self.playing { (self.vinyl_amt + ramp).min(1.0) } else { (self.vinyl_amt - ramp).max(0.0) };
+        let fx = Fx { vinyl: self.song.fx.vinyl * self.vinyl_amt, ..self.song.fx };
+        let out = [self.fx[0].process(mix[0], &fx, self.sr), self.fx[1].process(mix[1], &fx, self.sr)];
         self.peaks[BUSES] = self.peaks[BUSES].max(out[0].abs()).max(out[1].abs());
         out
     }
@@ -558,14 +579,36 @@ pub fn export_wav(path: &std::path::Path, song: Song) -> Result<(), hound::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts allocations and frees made by threads that set `WATCH` (other tests are unaffected).
+    struct CountingAlloc;
+    static HEAP_OPS: AtomicUsize = AtomicUsize::new(0);
+    thread_local! { static WATCH: Cell<bool> = const { Cell::new(false) }; }
+
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if WATCH.with(Cell::get) {
+                HEAP_OPS.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if WATCH.with(Cell::get) {
+                HEAP_OPS.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe { System.dealloc(p, l) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: CountingAlloc = CountingAlloc;
 
     fn silent() -> Song {
-        let mut s = Song::default();
-        s.drums = [[false; STEPS]; TRACKS];
-        s.chords = [0; BARS];
-        s.melody = [0; LEAD_KEYS];
-        s.fx.vinyl = 0.0;
-        s
+        let d = Song::default();
+        Song { drums: [[false; STEPS]; TRACKS], chords: [0; BARS], melody: [0; LEAD_KEYS], fx: Fx { vinyl: 0.0, ..d.fx }, ..d }
     }
 
     fn engine(song: Song, sr: f32) -> Engine {
@@ -685,6 +728,74 @@ mod tests {
         assert_eq!((spec.channels, spec.sample_rate), (2, 44100));
         // 2 loops x 4 bars at 80 BPM = 24 s, plus 2 s tail.
         assert_eq!(frames as usize, (24.0 * 44100.0) as usize + 88200);
+    }
+
+    /// The audio callback's work (drain commands, render frames) must not touch the heap.
+    #[test]
+    fn audio_path_never_allocates_or_frees() {
+        const SONGS: usize = 300;
+        let (tx, rx) = command_channel();
+        let mut e = Engine::new(22050.0);
+        // Like the app's UI thread: try_send, never a blocking send (a blocked sender
+        // registers a wakeup that the receiver may then touch).
+        let ui = std::thread::spawn(move || {
+            let send = |mut cmd: Cmd| loop {
+                match tx.try_send(cmd) {
+                    Ok(()) => break,
+                    Err(mpsc::TrySendError::Full(c)) => {
+                        cmd = c;
+                        std::thread::yield_now();
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            send(Cmd::Play(true));
+            for i in 0..SONGS {
+                send(Cmd::Song(Song { bpm: 80.0 + i as f32 * 0.1, ..Song::default() }));
+                send(Cmd::NoteOn(60 + (i % 12) as u8));
+                send(Cmd::NoteOff(60 + (i % 12) as u8));
+            }
+        });
+        let total = 1 + SONGS * 3;
+        let mut got = 0;
+        WATCH.with(|w| w.set(true));
+        while got < total {
+            while let Ok(cmd) = rx.try_recv() {
+                e.handle(cmd);
+                got += 1;
+            }
+            for _ in 0..64 {
+                e.next_frame();
+            }
+            e.take_peaks();
+        }
+        WATCH.with(|w| w.set(false));
+        ui.join().unwrap();
+        assert_eq!(HEAP_OPS.load(Ordering::Relaxed), 0, "audio path allocated or freed memory (got {got} cmds)");
+        assert!(e.playing && (e.song.bpm - (80.0 + (SONGS - 1) as f32 * 0.1)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn vinyl_crackles_while_playing() {
+        let mut s = silent();
+        s.fx.vinyl = 1.0;
+        assert!(peak(&mut engine(s, 22050.0), 22050 * 2)[0] > 0.01);
+    }
+
+    #[test]
+    fn stopped_engine_goes_silent() {
+        // Default song: vinyl on, chords, reverb. Play one bar, stop, let tails ring out.
+        let mut e = engine(Song::default(), 22050.0);
+        peak(&mut e, 22050 * 3);
+        e.handle(Cmd::Play(false));
+        peak(&mut e, 22050 * 3);
+        e.take_peaks();
+        let p = peak(&mut e, 22050 * 2);
+        assert!(p[0] < 1e-3 && p[1] < 1e-3, "{p:?}");
+        // The UI keeps redrawing while any meter is above 1e-3.
+        assert!(e.take_peaks().iter().all(|&m| m < 1e-3));
+        // A fresh engine that never played is silent too.
+        assert!(peak(&mut Engine::new(22050.0), 22050)[0] < 1e-3);
     }
 
     #[test]

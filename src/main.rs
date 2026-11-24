@@ -13,7 +13,7 @@ use widgets::*;
 /// `meters` hold f32 peak bits (positive floats order like their bits, so fetch_max works).
 struct Audio {
     _stream: cpal::Stream,
-    tx: mpsc::Sender<Cmd>,
+    tx: mpsc::SyncSender<Cmd>,
     pos: Arc<AtomicUsize>,
     meters: Arc<[AtomicU32; METERS]>,
 }
@@ -21,7 +21,7 @@ struct Audio {
 fn start_audio() -> Result<Audio, String> {
     let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
     let config = device.default_output_config().map_err(|e| e.to_string())?;
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = engine::command_channel();
     let pos = Arc::new(AtomicUsize::new(0));
     let meters: Arc<[AtomicU32; METERS]> = Arc::new(std::array::from_fn(|_| AtomicU32::new(0)));
     let shared = (rx, pos.clone(), meters.clone());
@@ -114,10 +114,10 @@ struct App {
 }
 
 impl App {
-    fn send(&self, cmd: Cmd) {
-        if let Some(a) = &self.audio {
-            let _ = a.tx.send(cmd);
-        }
+    /// Queue a command for the audio thread without blocking. False if there is no audio
+    /// or the queue is full (the audio thread drains it every callback, so it rarely is).
+    fn send(&self, cmd: Cmd) -> bool {
+        self.audio.as_ref().is_some_and(|a| a.tx.try_send(cmd).is_ok())
     }
 
     fn set_playing(&mut self, on: bool) {
@@ -279,8 +279,8 @@ impl eframe::App for App {
 
         windows::show(self, &ctx, area);
 
-        if self.sent != Some(self.song) {
-            self.send(Cmd::Song(self.song));
+        // If the queue was full, `sent` stays stale and the song goes out on the next frame.
+        if self.sent != Some(self.song) && self.send(Cmd::Song(self.song)) {
             self.sent = Some(self.song);
         }
         if self.playing || self.export_rx.is_some() || self.meters.iter().any(|&m| m > 1e-3) {

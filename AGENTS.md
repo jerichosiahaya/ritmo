@@ -23,12 +23,13 @@ Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian
 ## How data flows
 
 - `Song` is a plain `Copy` struct holding the whole project. The UI edits its own copy and sends `Cmd::Song(song)` by value whenever it changes.
-- The audio thread owns the `Engine` and drains an `mpsc` channel at the start of each callback.
+- The audio thread owns the `Engine` and drains the bounded queue from `engine::command_channel()` at the start of each callback. The UI sends with `try_send` and never blocks. Don't switch to an unbounded `mpsc::channel`: its receiver frees memory on the audio thread.
 - The audio thread reports back only through atomics: `pos` (playing step + 1, or 0 when stopped) and `meters` (f32 peak bits, merged with `fetch_max`).
 
 ## Rules
 
 - **Audio thread:** never allocate, lock, log or do I/O inside the cpal callback or in `Engine::next_frame`. Allocate buffers in `Engine::new`. Keep `Song` `Copy`: use fixed-size arrays (for example the `u64` bitmasks in `melody`), not `Vec`.
+- The test `audio_path_never_allocates_or_frees` counts heap operations on the audio path; keep it passing.
 - **Engine changes need a test** in `engine.rs` (render a few thousand frames and check levels, timing or state). Tests use low sample rates (8–22 kHz) to stay fast.
 - **Sequencer timing:** `BARS` × `STEPS` 16th steps; swing shortens odd steps and keeps each pair the same length (`step_len`).
 - **UI:** egui 0.37 / eframe 0.37 (`App::ui`, `egui::Panel`, `Ui::scope_id`). Use the colors in `widgets.rs` instead of new hard-coded ones. New controls need hover text, and custom widgets set `widget_info` for accessibility.
