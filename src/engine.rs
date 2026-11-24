@@ -13,43 +13,7 @@ use std::sync::mpsc;
 const VINYL_FADE: f32 = 0.25;
 
 // ---------------------------------------------------------------------------------------------
-// v0.1 song. The UI still edits this and converts it with `Project::from` (roadmap week 2 moves
-// the UI onto `Project` and removes it).
-
-pub const STEPS: usize = 16;
-pub const BARS: usize = 4;
-pub const TOTAL_STEPS: usize = STEPS * BARS;
-pub const TRACKS: usize = 3;
-
-pub const CHANNELS: usize = 6;
-pub const CHANNEL_NAMES: [&str; CHANNELS] = ["Kick", "Snare", "Hat", "Keys", "Bass", "Lead"];
-pub const BUSES: usize = 4;
-pub const BUS_NAMES: [&str; BUSES] = ["Drums", "Keys", "Bass", "Lead"];
-/// Mixer bus each channel feeds.
-pub const CH_BUS: [usize; CHANNELS] = [0, 0, 0, 1, 2, 3];
-
-/// Piano roll range: LEAD_LOW .. LEAD_LOW + LEAD_KEYS (C4..C6).
-pub const LEAD_LOW: u8 = 60;
-pub const LEAD_KEYS: usize = 25;
-
-pub struct Chord {
-    pub name: &'static str,
-    pub bass: u8,
-    pub notes: &'static [u8],
-}
-
-/// Index 0 is "no chord".
-pub const CHORDS: &[Chord] = &[
-    Chord { name: "—", bass: 0, notes: &[] },
-    Chord { name: "Dm9", bass: 38, notes: &[53, 57, 60, 64] },
-    Chord { name: "G13", bass: 43, notes: &[53, 59, 64, 69] },
-    Chord { name: "Cmaj9", bass: 36, notes: &[52, 55, 59, 62] },
-    Chord { name: "Am9", bass: 45, notes: &[55, 60, 64, 71] },
-    Chord { name: "Fmaj7", bass: 41, notes: &[53, 57, 60, 64] },
-    Chord { name: "Em7", bass: 40, notes: &[55, 59, 62, 64] },
-    Chord { name: "Bbmaj7", bass: 46, notes: &[53, 57, 58, 62] },
-    Chord { name: "A7", bass: 45, notes: &[55, 61, 64, 67] },
-];
+// Time and the snapshot the engine plays.
 
 /// Master insert: the lo-fi chain, plus master volume.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -64,78 +28,6 @@ pub struct Fx {
 
 /// Master insert that leaves the sound (nearly) untouched.
 pub const FX_NEUTRAL: Fx = Fx { tone: 1.0, crush: 0.0, wobble: 0.0, vinyl: 0.0, reverb: 0.0, volume: 0.8 };
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Channel {
-    pub vol: f32,
-    /// -1 = left, 1 = right.
-    pub pan: f32,
-    pub mute: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Song {
-    pub drums: [[bool; STEPS]; TRACKS],
-    pub chords: [usize; BARS],
-    pub bpm: f32,
-    /// Share of each 8th-note pair given to the first 16th: 0.5 = straight, 0.75 = hard swing.
-    pub swing: f32,
-    pub fx: Fx,
-    pub channels: [Channel; CHANNELS],
-    /// Mixer fader per bus.
-    pub bus: [f32; BUSES],
-    /// Piano roll: bit `s` of row `k` = pitch LEAD_LOW + k is held during global step `s`.
-    /// Adjacent set bits make one longer note.
-    pub melody: [u64; LEAD_KEYS],
-    /// Playlist: which bars play the drum pattern / the melody.
-    pub drum_bars: [bool; BARS],
-    pub lead_bars: [bool; BARS],
-}
-
-impl Song {
-    pub fn note(&self, pitch: u8, step: usize) -> bool {
-        pitch >= LEAD_LOW && ((pitch - LEAD_LOW) as usize) < LEAD_KEYS && self.melody[(pitch - LEAD_LOW) as usize] >> step & 1 == 1
-    }
-
-    pub fn set_note(&mut self, pitch: u8, step: usize, on: bool) {
-        let row = &mut self.melody[(pitch - LEAD_LOW) as usize];
-        if on { *row |= 1 << step } else { *row &= !(1 << step) }
-    }
-}
-
-impl Default for Song {
-    fn default() -> Self {
-        let p = |s: &str| {
-            let mut row = [false; STEPS];
-            for (i, c) in s.chars().enumerate() {
-                row[i] = c == 'x';
-            }
-            row
-        };
-        let mut song = Song {
-            drums: [p("x......x..x....."), p("....x.......x..."), p("x.x.x.x.x.x.x.x.")],
-            chords: [1, 2, 3, 4],
-            bpm: 80.0,
-            swing: 0.6,
-            fx: Fx { tone: 0.55, crush: 0.2, wobble: 0.35, vinyl: 0.4, reverb: 0.3, volume: 0.8 },
-            channels: [Channel { vol: 0.8, pan: 0.0, mute: false }; CHANNELS],
-            bus: [0.8; BUSES],
-            melody: [0; LEAD_KEYS],
-            drum_bars: [true; BARS],
-            lead_bars: [true; BARS],
-        };
-        // A short motif in bars 2 and 4: (pitch, start step, length).
-        for (pitch, start, len) in [(72, 20, 2), (69, 24, 2), (67, 28, 4), (72, 52, 2), (74, 56, 2), (76, 60, 4)] {
-            for s in start..start + len {
-                song.set_note(pitch, s, true);
-            }
-        }
-        song
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Time and the snapshot the engine plays.
 
 pub type Tick = u32;
 /// Ticks per quarter note. Divides evenly into 16ths (24) and 8th-note triplets (32).
@@ -161,6 +53,12 @@ pub enum Instrument {
     Rhodes,
     /// Sine bass (one note at a time).
     Bass,
+}
+
+impl Instrument {
+    pub fn is_drum(self) -> bool {
+        matches!(self, Instrument::Kick | Instrument::Snare | Instrument::Hat)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -745,9 +643,9 @@ mod tests {
 
     const UNITY: [f32; 2] = [1.0, 1.0];
 
-    /// The demo song as the engine plays it.
+    /// The demo project as the engine plays it.
     fn demo() -> Snapshot {
-        Project::from(&Song::default()).compile()
+        Project::demo().compile()
     }
 
     /// One mixer track, the given channels, these notes, a 1-bar loop.
@@ -795,12 +693,9 @@ mod tests {
     }
 
     #[test]
-    fn chord_table_is_sane() {
-        for c in &CHORDS[1..] {
-            assert!(c.notes.iter().all(|&n| (36..=96).contains(&n)), "{}", c.name);
-            assert!((24..60).contains(&c.bass), "{}", c.name);
-        }
+    fn midi_pitch() {
         assert!((midi_hz(69) - 440.0).abs() < 1e-3);
+        assert!((midi_hz(57) - 220.0).abs() < 1e-3);
     }
 
     #[test]
@@ -814,7 +709,7 @@ mod tests {
     #[test]
     fn demo_renders_audible_and_bounded() {
         let out = render_offline(&demo(), 22050, 1);
-        let expected = (BARS as f64 * 4.0 * 60.0 / 80.0 * 22050.0) as usize + 44100;
+        let expected = (4.0 * 4.0 * 60.0 / 80.0 * 22050.0) as usize + 44100;
         assert_eq!(out.len(), expected);
         let peak = out.iter().flatten().fold(0f32, |m, s| m.max(s.abs()));
         assert!(out.iter().flatten().all(|s| s.is_finite()));

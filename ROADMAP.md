@@ -187,14 +187,14 @@ Meters / waveforms  ◄──── shots  ├─ inserts, sends, buses         
 - **Distro checks** each release: Arch (CachyOS), Ubuntu LTS, Fedora; Wayland (GNOME, KDE, a tiling compositor such as niri) and X11.
 - **Render tests:** render reference projects offline and compare with stored results, allowing tiny differences.
 - **Null tests for effects:** effects with zero settings must pass audio unchanged.
-- **Real-time checks:** `assert_no_alloc` on the audio thread in debug builds; benchmark of engine CPU use per track and plugin.
+- **Real-time checks:** a heap guard on the audio thread in debug builds (`rt.rs`, done); benchmark of engine CPU use per track and plugin.
 - **Performance targets:** 64 audio tracks with effects at a 256-sample buffer (about 5 ms at 48 kHz) on a mid-range laptop; UI at 60 fps with 1,000 clips.
 - **File safety:** tests that every old project version opens; fuzz the project loader and audio decoders.
 - **Plugin compatibility list**, tested each release: Vital, Surge XT, Dexed, Odin 2, Cardinal (CLAP/VST3); LSP, Calf, x42, Dragonfly Reverb (LV2); Airwindows.
 
 ### Key dependencies (check each when its phase starts)
 
-`cpal` (audio I/O), `jack` (JACK), `midir` (MIDI), `symphonia` (decoding), `rubato` (resampling), `hound` (WAV), `rtrb` (lock-free queues), `serde` (project files), `clack` (CLAP host), LV2 bindings (`livi`/`lilv`), VST3 bindings, `raw-window-handle` (plugin GUIs), `egui`/`eframe` (UI), `egui_dock` (docking), `assert_no_alloc` (tests).
+`cpal` (audio I/O), `jack` (JACK), `midir` (MIDI), `symphonia` (decoding), `rubato` (resampling), `hound` (WAV), `rtrb` (lock-free queues), `serde` (project files), `clack` (CLAP host), LV2 bindings (`livi`/`lilv`), VST3 bindings, `raw-window-handle` (plugin GUIs), `egui`/`eframe` (UI), `egui_dock` (docking).
 
 ---
 
@@ -239,7 +239,7 @@ gantt
 | Week | Dates | Work |
 |---|---|---|
 | 1 | 25 Nov – 1 Dec | CI (build, test, clippy); new project model with IDs, next to `Song` ✅ |
-| 2 | 2 – 8 Dec | Engine reads the new model through snapshots with deferred freeing; `assert_no_alloc` in debug builds |
+| 2 | 2 – 8 Dec | Engine reads the new model through snapshots with deferred freeing; `assert_no_alloc` in debug builds ✅ (done early, 24 Nov; a small heap guard in `rt.rs` instead of the crate; the UI edits the project model too) |
 | 3 | 9 – 15 Dec | Save/open `.ritmo` files with a format version; autosave |
 | 4 | 16 – 22 Dec | Undo/redo (commands for steps, notes, clips, mixer) |
 | 5 | 23 – 29 Dec | Holiday buffer; fix bugs |

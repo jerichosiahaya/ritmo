@@ -16,7 +16,7 @@ Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian
 ## Layout
 
 - `src/engine.rs`: everything audio, with no I/O and no UI. It plays a `Snapshot` (channels, mixer tracks and notes placed in song time, in ticks) with the synths (drums, FM Rhodes, sine bass), the mixer (channels → mixer tracks → master) and the lo-fi master chain. `render_offline` and `export_wav` use the same engine as live playback.
-- `src/project.rs`: the v0.2 project model (channels, mixer tracks, patterns with notes, playlist tracks and clips, all with stable IDs; time in ticks, `PPQ` = 96). `compile()` builds the engine's `Snapshot`; `Project::from(&song)` converts the old song; `validate()` checks every invariant. Keep `validate()` and its tests in step with any new field.
+- `src/project.rs`: the v0.2 project model (channels, mixer tracks, patterns with notes, playlist tracks and clips, all with stable IDs; time in ticks, `PPQ` = 96). `compile()` builds the engine's `Snapshot`; `validate()` checks every invariant (debug builds run it after every edit). Editing operations the windows use (`toggle_step`, `set_cell`, `stamp_chord`, `toggle_bar`, …) live here with tests, not in the UI. `Project::demo()` is the startup song. Keep `validate()` and its tests in step with any new field.
 - `src/rt.rs`: the real-time guard. In debug and test builds it counts heap use inside `rt::enter()`/`rt::exit()` (the audio callback); the status bar shows a warning if it ever happens.
 - `src/main.rs`: app state (`App`), the cpal audio stream, toolbar, browser panel, keyboard shortcuts.
 - `src/windows.rs`: the floating windows (Playlist, Channel Rack, Piano Roll, Mixer).
@@ -24,7 +24,7 @@ Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian
 
 ## How data flows
 
-- The UI edits its state and, whenever it changes, compiles a `Snapshot` and sends it whole as `Cmd::Snapshot(Box<Snapshot>)`. (For now the UI still edits the v0.1 `Song` and converts it with `Project::from(&song).compile()`.)
+- The UI edits `app.project` and, whenever it changed since the last frame, compiles a `Snapshot` and sends it whole as `Cmd::Snapshot(Box<Snapshot>)`. Windows refer to channels, patterns and tracks by ID; the engine sees indices.
 - The audio thread owns the `Engine` and drains the bounded queue from `engine::command_channel()` at the start of each callback. The UI sends with `try_send` and never blocks. Don't switch to an unbounded `mpsc::channel`: its receiver frees memory on the audio thread.
 - The engine never drops a snapshot: it sends the one it replaces back through `engine::trash_channel()`, and the UI drops it each frame.
 - The audio thread reports back only through atomics: `pos` (playing step + 1, or 0 when stopped) and `meters` (f32 peak bits, merged with `fetch_max`).

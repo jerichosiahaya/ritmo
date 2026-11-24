@@ -6,8 +6,8 @@ mod windows;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{self, Color32, Key, RichText};
-use engine::{Cmd, Engine, Snapshot, Song, CHORDS, METERS, STEP, STEPS};
-use project::Project;
+use engine::{Cmd, Engine, Instrument, METERS, Snapshot, STEP};
+use project::{CHORDS, ChannelId, PatternId, Project, Tick, TrackId};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use widgets::*;
@@ -73,9 +73,6 @@ fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(device: &cpal::Device, co
         .map_err(|e| e.to_string())
 }
 
-/// Channel index that live notes play on (Lead).
-pub const LIVE_CHANNEL: u16 = 5;
-
 /// Typing keyboard as piano: bottom row = C3 octave, top row = C4 octave.
 fn key_note(k: Key) -> Option<u8> {
     use Key::*;
@@ -105,8 +102,11 @@ const WINDOWS: [(Win, &str, Key); 4] = [
 ];
 
 struct App {
-    song: Song,
-    sent: Option<Song>,
+    project: Project,
+    /// The project as last sent to the engine, and its compiled form (the windows draw previews
+    /// from it).
+    sent: Option<Project>,
+    snap: Snapshot,
     playing: bool,
     audio: Option<Audio>,
     status: String,
@@ -114,17 +114,56 @@ struct App {
     open: [bool; 4],
     /// Smoothed meter levels for display.
     meters: [f32; METERS],
-    /// Playlist bar that a clicked chord in the browser goes to.
-    selected_bar: usize,
+    /// Playlist selection; a chord clicked in the browser is stamped there.
+    sel_track: Option<TrackId>,
+    sel_bar: Tick,
+    /// Pattern the Channel Rack's step grid edits.
+    pattern: PatternId,
+    /// Pattern and channel the Piano Roll edits, and its lowest visible key.
+    roll: (PatternId, ChannelId),
+    roll_low: u8,
+    /// Channel the typing keyboard and the piano-roll keys play.
+    live: ChannelId,
     /// Piano-roll drag: Some(true) draws notes, Some(false) erases.
     roll_paint: Option<bool>,
     /// Note sounding from a click on the piano-roll keyboard.
     preview: Option<u8>,
-    /// Current playing step, if playing.
-    cur: Option<usize>,
+    /// Playing tick, if playing.
+    cur: Option<Tick>,
 }
 
 impl App {
+    fn new(project: Project, audio: Option<Audio>, status: String) -> Self {
+        let has_notes = |p: &project::Pattern, f: &dyn Fn(Instrument) -> bool| p.notes.iter().any(|n| project.channel(n.channel).is_some_and(|c| f(c.instrument)));
+        let pattern = project.patterns.iter().find(|p| has_notes(p, &Instrument::is_drum)).or(project.patterns.first()).map_or(PatternId(0), |p| p.id);
+        // The piano roll starts on the last melodic channel (the lead in the demo).
+        let roll_ch = project.channels.iter().rev().find(|c| !c.instrument.is_drum()).or(project.channels.first()).map_or(ChannelId(0), |c| c.id);
+        let roll_pat = project.patterns.iter().find(|p| p.notes.iter().any(|n| n.channel == roll_ch)).map_or(pattern, |p| p.id);
+        let mut app = App {
+            sel_track: project.tracks.first().map(|t| t.id),
+            project,
+            sent: None,
+            snap: Snapshot::default(),
+            playing: false,
+            audio,
+            status,
+            export_rx: None,
+            open: [true, true, false, false],
+            meters: [0.0; METERS],
+            sel_bar: 0,
+            pattern,
+            roll: (roll_pat, roll_ch),
+            roll_low: 60,
+            live: roll_ch,
+            roll_paint: None,
+            preview: None,
+            cur: None,
+        };
+        app.edit_in_roll(roll_pat, roll_ch);
+        app.open[Win::Roll as usize] = false;
+        app
+    }
+
     /// Queue a command for the audio thread without blocking. False if there is no audio
     /// or the queue is full (the audio thread drains it every callback, so it rarely is).
     fn send(&self, cmd: Cmd) -> bool {
@@ -140,8 +179,44 @@ impl App {
         self.open[w as usize]
     }
 
+    /// Engine index of the channel the keyboard plays.
+    fn live_index(&self) -> u16 {
+        self.project.channel_index(self.live).map_or(u16::MAX, |i| i as u16)
+    }
+
+    /// Opens the piano roll on `channel`'s notes in `pattern`, scrolled to them, and makes the
+    /// keyboard play that channel.
+    fn edit_in_roll(&mut self, pattern: PatternId, channel: ChannelId) {
+        self.roll = (pattern, channel);
+        self.live = channel;
+        let lowest = self.project.pattern(pattern).and_then(|p| p.notes.iter().filter(|n| n.channel == channel).map(|n| n.pitch).min());
+        let default = if self.project.channel(channel).is_some_and(|c| c.instrument == Instrument::Bass) { 36 } else { 60 };
+        let low = lowest.map_or(default, |n| n - n % 12);
+        self.roll_low = low.min(127 - windows::ROLL_KEYS as u8 + 1);
+        self.open[Win::Roll as usize] = true;
+    }
+
+    /// Opens the piano roll on the pattern `channel` plays most from (or the rack's pattern).
+    fn edit_channel(&mut self, channel: ChannelId) {
+        let count = |p: &&project::Pattern| p.notes.iter().filter(|n| n.channel == channel).count();
+        let pattern = self.project.patterns.iter().filter(|p| count(p) > 0).max_by_key(count).map_or(self.pattern, |p| p.id);
+        self.edit_in_roll(pattern, channel);
+    }
+
+    /// Stamps chord `j` on the playlist bar `bar` of `track`, in whatever clip plays there.
+    fn stamp_chord(&mut self, track: TrackId, bar: Tick, j: usize) {
+        let bl = self.project.bar_len();
+        let Some(c) = self.project.clip_at(track, bar * bl).copied() else {
+            self.status = "Pick a bar that has a clip to put the chord in.".into();
+            return;
+        };
+        if !self.project.stamp_chord(c.pattern, bar * bl - c.start + c.offset, bl, j) {
+            self.status = "Chords need an electric-piano channel in the Channel Rack.".into();
+        }
+    }
+
     fn export(&mut self) {
-        let snap = Project::from(&self.song).compile();
+        let snap = self.project.compile();
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let dir = std::path::Path::new(&home).join("Music");
         let dir = if dir.is_dir() { dir } else { std::path::PathBuf::from(".") };
@@ -170,9 +245,9 @@ impl App {
                 }
             } else if key == Key::Space && pressed {
                 self.set_playing(!self.playing);
-            } else if let Some(n) = key_note(key) {
-                let channel = LIVE_CHANNEL;
-                self.send(if pressed { Cmd::NoteOn { channel, pitch: n } } else { Cmd::NoteOff { channel, pitch: n } });
+            } else if let Some(pitch) = key_note(key) {
+                let channel = self.live_index();
+                self.send(if pressed { Cmd::NoteOn { channel, pitch } } else { Cmd::NoteOff { channel, pitch } });
             }
         }
     }
@@ -187,13 +262,14 @@ impl App {
             if ui.add(egui::Button::new(RichText::new("■").size(16.0))).on_hover_text("Stop (Space)").clicked() {
                 self.set_playing(false);
             }
-            let (bar, step) = self.cur.map_or((1, 1), |c| (c / STEPS + 1, c % STEPS + 1));
-            lcd(ui, &format!("{bar}:{step:02}"), &format!("{:.0} BPM\nBAR:STEP", self.song.bpm));
-            ui.add(egui::DragValue::new(&mut self.song.bpm).range(50.0..=180.0).speed(0.5).suffix(" bpm")).on_hover_text("Tempo: drag or type");
+            let bl = self.project.bar_len();
+            let (bar, step) = self.cur.map_or((1, 1), |t| (t / bl + 1, t % bl / STEP + 1));
+            lcd(ui, &format!("{bar}:{step:02}"), &format!("{:.0} BPM\nBAR:STEP", self.project.bpm));
+            ui.add(egui::DragValue::new(&mut self.project.bpm).range(50.0..=180.0).speed(0.5).suffix(" bpm")).on_hover_text("Tempo: drag or type");
             ui.label("Swing");
-            knob(ui, &mut self.song.swing, 0.5..=0.75, 0.6, "Swing", ACCENT);
+            knob(ui, &mut self.project.swing, 0.5..=0.75, 0.6, "Swing", ACCENT);
             ui.label("Master");
-            knob(ui, &mut self.song.fx.volume, 0.0..=1.0, 0.8, "Master volume", ACCENT);
+            knob(ui, &mut self.project.master.volume, 0.0..=1.0, 0.8, "Master volume", ACCENT);
             ui.separator();
             for (w, name, key) in WINDOWS {
                 let open = &mut self.open[w as usize];
@@ -214,35 +290,63 @@ impl App {
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::CollapsingHeader::new("🎹 Instruments").default_open(true).show(ui, |ui| {
-                for (i, (name, kind)) in [("Kick", "synth drum"), ("Snare", "synth drum"), ("Hat", "synth drum"), ("Keys", "FM Rhodes"), ("Bass", "sine bass"), ("Lead", "FM Rhodes")].iter().enumerate() {
-                    let text = RichText::new(format!("■ {name}")).color(CH_COLORS[i]);
-                    if ui.selectable_label(false, text).on_hover_text(*kind).clicked() {
-                        self.open[if i == 5 { Win::Roll } else { Win::Rack } as usize] = true;
+                for i in 0..self.project.channels.len() {
+                    let c = &self.project.channels[i];
+                    let (id, inst) = (c.id, c.instrument);
+                    let text = RichText::new(format!("■ {}", c.name)).color(channel_color(i));
+                    let hint = if inst.is_drum() { "Synth drum · click to play it from the keyboard" } else { "Click to edit in the piano roll" };
+                    if ui.selectable_label(self.live == id, text).on_hover_text(hint).clicked() {
+                        if inst.is_drum() {
+                            self.live = id;
+                            self.open[Win::Rack as usize] = true;
+                        } else {
+                            self.edit_channel(id);
+                        }
                     }
                 }
             });
             egui::CollapsingHeader::new("🎵 Chords").default_open(true).show(ui, |ui| {
-                ui.label(RichText::new(format!("Click: set bar {}\nDrag: drop on a playlist bar", self.selected_bar + 1)).small().weak());
+                ui.label(RichText::new(format!("Click: put on bar {}\nDrag: drop on a playlist bar", self.sel_bar + 1)).small().weak());
                 for (j, c) in CHORDS.iter().enumerate().skip(1) {
                     let id = egui::Id::unique(("chord-src", j));
                     let resp = ui.dnd_drag_source(id, j, |ui| {
                         ui.label(RichText::new(format!("♪ {}", c.name)).color(chord_color(j)));
                     }).response;
-                    if resp.clicked() {
-                        self.song.chords[self.selected_bar] = j;
+                    if resp.clicked()
+                        && let Some(track) = self.sel_track
+                    {
+                        self.stamp_chord(track, self.sel_bar, j);
                     }
                 }
             });
             egui::CollapsingHeader::new("▦ Patterns").default_open(true).show(ui, |ui| {
-                if ui.selectable_label(false, "Pattern 1 (drums)").clicked() {
-                    self.open[Win::Rack as usize] = true;
-                }
-                if ui.selectable_label(false, "Melody (lead)").clicked() {
-                    self.open[Win::Roll as usize] = true;
+                for (i, p) in self.project.patterns.iter().enumerate() {
+                    let resp = ui
+                        .selectable_label(self.pattern == p.id, RichText::new(&p.name).color(pattern_color(i)))
+                        .on_hover_text("Click: edit its steps in the Channel Rack · double-click: piano roll");
+                    if resp.double_clicked() {
+                        let ch = p.notes.iter().map(|n| n.channel).find(|&c| self.project.channel(c).is_some_and(|c| !c.instrument.is_drum()));
+                        let (pid, ch) = (p.id, ch.unwrap_or(self.roll.1));
+                        self.edit_in_roll(pid, ch);
+                        break;
+                    } else if resp.clicked() {
+                        self.pattern = p.id;
+                        self.open[Win::Rack as usize] = true;
+                    }
                 }
             });
         });
     }
+}
+
+/// Color for the `i`th channel or mixer track.
+pub fn channel_color(i: usize) -> Color32 {
+    CH_COLORS[i % CH_COLORS.len()]
+}
+
+/// Color for the `i`th pattern's clips.
+pub fn pattern_color(i: usize) -> Color32 {
+    chord_color(i * 3 + 1)
 }
 
 pub fn chord_color(j: usize) -> Color32 {
@@ -260,7 +364,7 @@ impl eframe::App for App {
             self.export_rx = None;
         }
         if let Some(a) = &self.audio {
-            self.cur = a.pos.load(Ordering::Relaxed).checked_sub(1).map(|tick| tick / STEP as usize);
+            self.cur = a.pos.load(Ordering::Relaxed).checked_sub(1).map(|t| t as Tick);
             // Snapshots the engine replaced are freed here, off the audio thread.
             while a.trash.try_recv().is_ok() {}
             for (shown, m) in self.meters.iter_mut().zip(a.meters.iter()) {
@@ -277,7 +381,8 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(BG_DEEP).inner_margin(egui::Margin::symmetric(8, 2)))
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("Keys: Z–M = C3 octave · Q–P = C4 octave · Space play/stop · F5 Playlist · F6 Rack · F7 Piano Roll · F9 Mixer").small().weak());
+                    let live = self.project.channel(self.live).map_or("—", |c| c.name.as_str());
+                    ui.label(RichText::new(format!("Keys play {live}: Z–M = C3 · Q–P = C4 · Space play/stop · F5 Playlist · F6 Rack · F7 Piano Roll · F9 Mixer")).small().weak());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(&self.status).small());
                         // Debug builds only: the real-time guard saw the audio thread use the heap.
@@ -301,9 +406,18 @@ impl eframe::App for App {
 
         windows::show(self, &ctx, area);
 
-        // If the queue was full, `sent` stays stale and the song goes out on the next frame.
-        if self.sent != Some(self.song) && self.send(Cmd::Snapshot(Box::new(Project::from(&self.song).compile()))) {
-            self.sent = Some(self.song);
+        // Send the project whenever it changed. If the queue was full, `sent` stays stale and it
+        // goes out on the next frame.
+        if self.sent.as_ref() != Some(&self.project) {
+            // Debug builds check that every edit keeps the project valid.
+            if let Err(e) = self.project.validate() {
+                debug_assert!(false, "edit broke the project: {e}");
+            }
+            let snap = self.project.compile();
+            if self.send(Cmd::Snapshot(Box::new(snap.clone()))) || self.audio.is_none() {
+                self.snap = snap;
+                self.sent = Some(self.project.clone());
+            }
         }
         if self.playing || self.export_rx.is_some() || self.meters.iter().any(|&m| m > 1e-3) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -325,21 +439,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             apply_theme(&cc.egui_ctx);
-            Ok(Box::new(App {
-                song: Song::default(),
-                sent: None,
-                playing: false,
-                audio,
-                status,
-                export_rx: None,
-                open: [true, true, false, false],
-                meters: [0.0; METERS],
-                selected_bar: 0,
-                roll_paint: None,
-                preview: None,
-                cur: None,
-            }))
+            Ok(Box::new(App::new(Project::demo(), audio, status)))
         }),
     )
 }
-

@@ -1,6 +1,5 @@
 //! Project model: everything a song is made of, in growable collections referenced by
-//! stable IDs. It replaces the fixed-size `Song` during v0.2 (see ROADMAP.md). For now it
-//! lives next to `Song`, and `Project::from(&song)` converts the current song.
+//! stable IDs. The UI edits a `Project`; `compile()` turns it into the engine's `Snapshot`.
 //!
 //! - Channels (Channel Rack) hold an instrument and route into a mixer track.
 //! - Patterns hold notes; each note names the channel it plays on. Drum steps are short notes.
@@ -9,14 +8,7 @@
 //!
 //! IDs come from one counter per project and are never reused, even after a delete.
 
-// The UI still edits `Song` and only converts and compiles it; the rest of this API is used once
-// the UI moves onto `Project` (roadmap week 2, second step).
-#![allow(dead_code)]
-
-use crate::engine::{
-    BARS, BUS_NAMES, CHANNEL_NAMES, CHORDS, CH_BUS, ChannelMix, FX_NEUTRAL, Fx, LEAD_KEYS, LEAD_LOW, MAX_CHANNELS, MAX_MIXER, MixerMix, STEPS, SeqNote, Snapshot, Song,
-    TOTAL_STEPS, TRACKS, pan_gains,
-};
+use crate::engine::{ChannelMix, FX_NEUTRAL, Fx, MAX_CHANNELS, MAX_MIXER, MixerMix, SeqNote, Snapshot, pan_gains};
 pub use crate::engine::{Instrument, PPQ, STEP, Tick};
 use std::collections::HashSet;
 
@@ -26,8 +18,27 @@ pub const MAX_BARS: Tick = 999;
 pub const STEP_PITCH: u8 = 60;
 /// Velocity for new notes (1..=127, like MIDI). 100 plays an instrument at its normal level.
 pub const DEFAULT_VEL: u8 = 100;
-/// Velocity of converted chord notes: softer than a melody on the same electric piano.
+/// Velocity of stamped chord notes: softer than a melody on the same electric piano.
 pub const CHORD_VEL: u8 = 53;
+
+pub struct Chord {
+    pub name: &'static str,
+    pub bass: u8,
+    pub notes: &'static [u8],
+}
+
+/// Index 0 is "no chord".
+pub const CHORDS: &[Chord] = &[
+    Chord { name: "—", bass: 0, notes: &[] },
+    Chord { name: "Dm9", bass: 38, notes: &[53, 57, 60, 64] },
+    Chord { name: "G13", bass: 43, notes: &[53, 59, 64, 69] },
+    Chord { name: "Cmaj9", bass: 36, notes: &[52, 55, 59, 62] },
+    Chord { name: "Am9", bass: 45, notes: &[55, 60, 64, 71] },
+    Chord { name: "Fmaj7", bass: 41, notes: &[53, 57, 60, 64] },
+    Chord { name: "Em7", bass: 40, notes: &[55, 59, 62, 64] },
+    Chord { name: "Bbmaj7", bass: 46, notes: &[53, 57, 58, 62] },
+    Chord { name: "A7", bass: 45, notes: &[55, 61, 64, 67] },
+];
 
 macro_rules! ids {
     ($($(#[$doc:meta])* $name:ident),* $(,)?) => {$(
@@ -225,14 +236,20 @@ impl Project {
     /// Places `pattern` from its start. None if the track or pattern does not exist,
     /// the clip is empty, or it ends past `MAX_BARS`.
     pub fn add_clip(&mut self, track: TrackId, pattern: PatternId, start: Tick, len: Tick) -> Option<ClipId> {
+        self.add_clip_at(track, pattern, start, len, 0)
+    }
+
+    /// Like `add_clip`, playing the pattern from `offset`.
+    pub fn add_clip_at(&mut self, track: TrackId, pattern: PatternId, start: Tick, len: Tick, offset: Tick) -> Option<ClipId> {
         if self.track(track).is_none() || self.pattern(pattern).is_none() || len == 0 || start + len > MAX_BARS * self.bar_len() {
             return None;
         }
         let id = ClipId(self.fresh_id());
-        self.clips.push(Clip { id, track, pattern, start, len, offset: 0 });
+        self.clips.push(Clip { id, track, pattern, start, len, offset });
         Some(id)
     }
 
+    #[allow(dead_code)] // The UI's delete commands arrive with undo (roadmap week 4).
     pub fn remove_note(&mut self, pattern: PatternId, note: NoteId) -> bool {
         self.pattern_mut(pattern).is_some_and(|p| remove(&mut p.notes, |n| n.id == note) > 0)
     }
@@ -242,18 +259,21 @@ impl Project {
     }
 
     /// Also removes every clip of the pattern.
+    #[allow(dead_code)] // The UI's delete commands arrive with undo (roadmap week 4).
     pub fn remove_pattern(&mut self, id: PatternId) -> bool {
         remove(&mut self.clips, |c| c.pattern == id);
         remove(&mut self.patterns, |p| p.id == id) > 0
     }
 
     /// Also removes every clip on the track.
+    #[allow(dead_code)] // The UI's delete commands arrive with undo (roadmap week 4).
     pub fn remove_track(&mut self, id: TrackId) -> bool {
         remove(&mut self.clips, |c| c.track == id);
         remove(&mut self.tracks, |t| t.id == id) > 0
     }
 
     /// Also removes the channel's notes from every pattern.
+    #[allow(dead_code)] // The UI's delete commands arrive with undo (roadmap week 4).
     pub fn remove_channel(&mut self, id: ChannelId) -> bool {
         for p in &mut self.patterns {
             remove(&mut p.notes, |n| n.channel == id);
@@ -279,10 +299,6 @@ impl Project {
 
     pub fn track(&self, id: TrackId) -> Option<&Track> {
         self.tracks.iter().find(|t| t.id == id)
-    }
-
-    pub fn clip(&self, id: ClipId) -> Option<&Clip> {
-        self.clips.iter().find(|c| c.id == id)
     }
 
     /// Builds what the engine plays: indices instead of IDs, volume and pan as gains, and every
@@ -392,99 +408,190 @@ impl Project {
     }
 }
 
+/// Editing operations the windows use. Each keeps the project valid.
+impl Project {
+    pub fn channel_index(&self, id: ChannelId) -> Option<usize> {
+        self.channels.iter().position(|c| c.id == id)
+    }
+
+    /// First channel playing `instrument` that has notes in `pattern`, else the first such channel.
+    pub fn channel_for(&self, pattern: PatternId, instrument: Instrument) -> Option<ChannelId> {
+        let mut of_kind = self.channels.iter().filter(|c| c.instrument == instrument);
+        let used = |c: &&Channel| self.pattern(pattern).is_some_and(|p| p.notes.iter().any(|n| n.channel == c.id));
+        of_kind.clone().find(used).or_else(|| of_kind.next()).map(|c| c.id)
+    }
+
+    /// Whether `channel` has a note starting on 16th `step` of `pattern`.
+    pub fn step(&self, pattern: PatternId, channel: ChannelId, step: Tick) -> bool {
+        self.pattern(pattern).is_some_and(|p| p.notes.iter().any(|n| n.channel == channel && n.start == step * STEP))
+    }
+
+    /// Step sequencer click: adds a 16th note on `step`, or removes the notes starting there.
+    pub fn toggle_step(&mut self, pattern: PatternId, channel: ChannelId, step: Tick) {
+        if self.step(pattern, channel, step) {
+            if let Some(p) = self.pattern_mut(pattern) {
+                remove(&mut p.notes, |n| n.channel == channel && n.start == step * STEP);
+            }
+        } else {
+            self.add_note(pattern, channel, STEP_PITCH, step * STEP, STEP, DEFAULT_VEL);
+        }
+    }
+
+    /// Whether a note of `channel` at `pitch` sounds during 16th `step` of `pattern`.
+    pub fn cell(&self, pattern: PatternId, channel: ChannelId, pitch: u8, step: Tick) -> bool {
+        let t = step * STEP;
+        self.pattern(pattern).is_some_and(|p| p.notes.iter().any(|n| n.channel == channel && n.pitch == pitch && n.start <= t && t < n.end()))
+    }
+
+    /// Piano-roll painting on the 16th grid. Turning a cell on joins it with notes that end or
+    /// start right next to it; turning it off splits the note it was part of.
+    pub fn set_cell(&mut self, pattern: PatternId, channel: ChannelId, pitch: u8, step: Tick, on: bool) {
+        let (t, next) = (step * STEP, step * STEP + STEP);
+        let Some(p) = self.pattern_mut(pattern) else { return };
+        let same = |n: &Note| n.channel == channel && n.pitch == pitch;
+        let covering = p.notes.iter().position(|n| same(n) && n.start <= t && t < n.end());
+        match (on, covering) {
+            (true, None) => {
+                let left = p.notes.iter().position(|n| same(n) && n.end() == t).map(|i| p.notes.remove(i));
+                let right = p.notes.iter().position(|n| same(n) && n.start == next).map(|i| p.notes.remove(i));
+                let start = left.map_or(t, |n| n.start);
+                let end = right.map_or(next, |n| n.end());
+                let vel = left.or(right).map_or(DEFAULT_VEL, |n| n.vel);
+                self.add_note(pattern, channel, pitch, start, end - start, vel);
+            }
+            (false, Some(i)) => {
+                let n = p.notes.remove(i);
+                if n.start < t {
+                    self.add_note(pattern, channel, pitch, n.start, t - n.start, n.vel);
+                }
+                if next < n.end() {
+                    self.add_note(pattern, channel, pitch, next, n.end() - next, n.vel);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Writes `CHORDS[chord]` over `start..start + len` of `pattern`: keys on an electric-piano
+    /// channel and the root on a bass channel (see `channel_for`), replacing the notes those
+    /// channels started there. Chord 0 just clears. False if the project has no piano channel.
+    pub fn stamp_chord(&mut self, pattern: PatternId, start: Tick, len: Tick, chord: usize) -> bool {
+        let (Some(keys), bass) = (self.channel_for(pattern, Instrument::Rhodes), self.channel_for(pattern, Instrument::Bass)) else { return false };
+        let Some(p) = self.pattern_mut(pattern) else { return false };
+        remove(&mut p.notes, |n| (n.channel == keys || Some(n.channel) == bass) && (start..start + len).contains(&n.start));
+        let c = &CHORDS[chord.min(CHORDS.len() - 1)];
+        for &n in c.notes {
+            self.add_note(pattern, keys, n, start, len, CHORD_VEL);
+        }
+        if let (Some(bass), true) = (bass, c.bass > 0) {
+            self.add_note(pattern, bass, c.bass, start, len, DEFAULT_VEL);
+        }
+        true
+    }
+
+    /// Index into `CHORDS` of the chord the electric-piano notes starting at `start` spell, or 0.
+    pub fn chord_at(&self, pattern: PatternId, start: Tick) -> usize {
+        let Some(p) = self.pattern(pattern) else { return 0 };
+        let piano = |c: ChannelId| self.channel(c).is_some_and(|c| c.instrument == Instrument::Rhodes);
+        let mut got: Vec<u8> = p.notes.iter().filter(|n| n.start == start && piano(n.channel)).map(|n| n.pitch).collect();
+        got.sort_unstable();
+        CHORDS.iter().position(|c| {
+            let mut want = c.notes.to_vec();
+            want.sort_unstable();
+            !want.is_empty() && want == got
+        })
+        .unwrap_or(0)
+    }
+
+    /// The clip on `track` that plays at `tick`.
+    pub fn clip_at(&self, track: TrackId, tick: Tick) -> Option<&Clip> {
+        self.clips.iter().find(|c| c.track == track && c.start <= tick && tick < c.end())
+    }
+
+    /// Where `pattern` is playing at song time `tick`, through any clip on an unmuted track.
+    pub fn pattern_pos(&self, pattern: PatternId, tick: Tick) -> Option<Tick> {
+        let playing = |c: &&Clip| c.pattern == pattern && c.start <= tick && tick < c.end() && self.track(c.track).is_some_and(|t| !t.mute);
+        self.clips.iter().find(playing).map(|c| tick - c.start + c.offset)
+    }
+
+    /// Playlist click on bar `bar` of `track`: if clips cover it, cuts that bar out of them;
+    /// otherwise places one bar of the track's nearest pattern (or `fallback` on an empty track),
+    /// taking the matching bar of a longer pattern, and joins it with neighbours that continue it.
+    pub fn toggle_bar(&mut self, track: TrackId, bar: Tick, fallback: PatternId) {
+        let bl = self.bar_len();
+        let (a, b) = (bar * bl, bar * bl + bl);
+        let hit: Vec<Clip> = self.clips.iter().filter(|c| c.track == track && c.start < b && a < c.end()).copied().collect();
+        if !hit.is_empty() {
+            for c in hit {
+                self.remove_clip(c.id);
+                if c.start < a {
+                    self.add_clip_at(track, c.pattern, c.start, a - c.start, c.offset);
+                }
+                if b < c.end() {
+                    self.add_clip_at(track, c.pattern, b, c.end() - b, c.offset + (b - c.start));
+                }
+            }
+            return;
+        }
+        let nearest = self.clips.iter().filter(|c| c.track == track).min_by_key(|c| if c.end() <= a { a - c.end() } else { c.start - b });
+        let pattern = nearest.map_or(fallback, |c| c.pattern);
+        let Some(len) = self.pattern(pattern).map(|p| p.len) else { return };
+        let offset = if len > bl && len % bl == 0 { a % len } else { 0 };
+        self.add_clip_at(track, pattern, a, bl, offset);
+        self.join_clips(track);
+    }
+
+    /// Joins clips on `track` that sit end to start and continue the same pattern.
+    fn join_clips(&mut self, track: TrackId) {
+        loop {
+            let on_track = || self.clips.iter().filter(|c| c.track == track);
+            let pair = on_track().find_map(|x| on_track().find(|y| y.pattern == x.pattern && x.end() == y.start && x.offset + x.len == y.offset).map(|y| (x.id, *y)));
+            let Some((keep, next)) = pair else { return };
+            self.remove_clip(next.id);
+            if let Some(c) = self.clips.iter_mut().find(|c| c.id == keep) {
+                c.len += next.len;
+            }
+        }
+    }
+
+    /// A short lo-fi loop: drums, four chords with bass, and a melody, over four bars.
+    pub fn demo() -> Project {
+        let mut p = Project { bpm: 80.0, swing: 0.6, master: Fx { tone: 0.55, crush: 0.2, wobble: 0.35, vinyl: 0.4, reverb: 0.3, volume: 0.8 }, ..Project::default() };
+        let bar = p.bar_len();
+        let mix: Vec<MixerId> = ["Drums", "Keys", "Bass", "Lead"].iter().filter_map(|n| p.add_mixer_track(n)).collect();
+        let channels = [("Kick", Instrument::Kick, 0), ("Snare", Instrument::Snare, 0), ("Hat", Instrument::Hat, 0), ("Keys", Instrument::Rhodes, 1), ("Bass", Instrument::Bass, 2), ("Lead", Instrument::Rhodes, 3)];
+        let ch: Vec<ChannelId> = channels.iter().filter_map(|&(name, inst, m)| p.add_channel(name, inst, mix[m])).collect();
+
+        let drums = p.add_pattern("Pattern 1", bar);
+        for (c, row) in ch.iter().zip(["x......x..x.....", "....x.......x...", "x.x.x.x.x.x.x.x."]) {
+            for (step, _) in row.char_indices().filter(|&(_, x)| x == 'x') {
+                p.toggle_step(drums, *c, step as Tick);
+            }
+        }
+        let chords = p.add_pattern("Chords", 4 * bar);
+        for (i, chord) in [1, 2, 3, 4].into_iter().enumerate() {
+            p.stamp_chord(chords, i as Tick * bar, bar, chord);
+        }
+        let melody = p.add_pattern("Melody", 4 * bar);
+        for (pitch, start, len) in [(72, 20, 2), (69, 24, 2), (67, 28, 4), (72, 52, 2), (74, 56, 2), (76, 60, 4)] {
+            p.add_note(melody, ch[5], pitch, start * STEP, len * STEP, DEFAULT_VEL);
+        }
+
+        let (t_chords, t_drums, t_melody) = (p.add_track("Chords"), p.add_track("Drums"), p.add_track("Melody"));
+        p.add_clip(t_chords, chords, 0, 4 * bar);
+        for b in 0..4 {
+            p.add_clip(t_drums, drums, b * bar, bar);
+        }
+        p.add_clip(t_melody, melody, 0, 4 * bar);
+        p
+    }
+}
+
 /// Removes the items matching `f` and returns how many were removed.
 fn remove<T>(v: &mut Vec<T>, f: impl Fn(&T) -> bool) -> usize {
     let before = v.len();
     v.retain(|x| !f(x));
     before - v.len()
-}
-
-/// Converts the v0.1 song. Chords become ordinary notes on the Keys and Bass channels;
-/// adjacent melody cells become one note, as the engine plays them.
-impl From<&Song> for Project {
-    fn from(s: &Song) -> Self {
-        let mut p = Project { bpm: s.bpm, swing: s.swing, master: s.fx, ..Project::default() };
-        let bar = p.bar_len();
-        let mixer: Vec<MixerId> = BUS_NAMES
-            .iter()
-            .zip(s.bus)
-            .map(|(name, vol)| {
-                let id = p.add_mixer_track(name).expect("under the mixer limit");
-                p.mixer.last_mut().expect("just added").vol = vol;
-                id
-            })
-            .collect();
-        let instruments = [Instrument::Kick, Instrument::Snare, Instrument::Hat, Instrument::Rhodes, Instrument::Bass, Instrument::Rhodes];
-        let ch: Vec<ChannelId> = (0..CHANNEL_NAMES.len())
-            .map(|i| {
-                let id = p.add_channel(CHANNEL_NAMES[i], instruments[i], mixer[CH_BUS[i]]).expect("mixer track exists");
-                let (c, src) = (p.channels.last_mut().expect("just added"), s.channels[i]);
-                (c.vol, c.pan, c.mute) = (src.vol, src.pan, src.mute);
-                id
-            })
-            .collect();
-        let (keys, bass, lead) = (ch[3], ch[4], ch[5]);
-        let song_len = BARS as Tick * bar;
-
-        let drums = p.add_pattern("Pattern 1", bar);
-        for (tr, row) in s.drums.iter().enumerate().take(TRACKS) {
-            for step in (0..STEPS).filter(|&st| row[st]) {
-                p.add_note(drums, ch[tr], STEP_PITCH, step as Tick * STEP, STEP, DEFAULT_VEL);
-            }
-        }
-
-        let chords = p.add_pattern("Chords", song_len);
-        for (b, &j) in s.chords.iter().enumerate() {
-            let c = &CHORDS[j.min(CHORDS.len() - 1)];
-            let start = b as Tick * bar;
-            for &n in c.notes {
-                p.add_note(chords, keys, n, start, bar, CHORD_VEL);
-            }
-            if c.bass > 0 {
-                p.add_note(chords, bass, c.bass, start, bar, DEFAULT_VEL);
-            }
-        }
-
-        let melody = p.add_pattern("Melody", song_len);
-        for (k, &row) in s.melody.iter().enumerate().take(LEAD_KEYS) {
-            let mut step = 0;
-            while step < TOTAL_STEPS {
-                if row >> step & 1 == 0 {
-                    step += 1;
-                    continue;
-                }
-                let first = step;
-                while step < TOTAL_STEPS && row >> step & 1 == 1 {
-                    step += 1;
-                }
-                let (start, len) = (first as Tick * STEP, (step - first) as Tick * STEP);
-                p.add_note(melody, lead, LEAD_LOW + k as u8, start, len, DEFAULT_VEL);
-            }
-        }
-
-        let (chord_track, drum_track, melody_track) = (p.add_track("Chords"), p.add_track("Drums"), p.add_track("Melody"));
-        p.add_clip(chord_track, chords, 0, song_len);
-        for b in (0..BARS).filter(|&b| s.drum_bars[b]) {
-            p.add_clip(drum_track, drums, b as Tick * bar, bar);
-        }
-        // One clip per run of enabled bars, so a note held across bars is not cut.
-        let mut b = 0;
-        while b < BARS {
-            if !s.lead_bars[b] {
-                b += 1;
-                continue;
-            }
-            let first = b;
-            while b < BARS && s.lead_bars[b] {
-                b += 1;
-            }
-            let start = first as Tick * bar;
-            if p.add_clip(melody_track, melody, start, (b - first) as Tick * bar).is_some() {
-                p.clips.last_mut().expect("just added").offset = start;
-            }
-        }
-        p
-    }
 }
 
 #[cfg(test)]
@@ -513,104 +620,132 @@ mod tests {
         (p, ch, pat, tr, clip)
     }
 
-    #[test]
-    fn default_song_converts_and_validates() {
-        let s = Song::default();
-        let p = Project::from(&s);
-        p.validate().unwrap();
-        assert_eq!((p.mixer.len(), p.channels.len(), p.patterns.len(), p.tracks.len()), (4, 6, 3, 3));
-        assert_eq!((p.bpm, p.swing, p.master), (s.bpm, s.swing, s.fx));
-        // Drums: 3 kicks, 2 snares, 8 hats in a 1-bar pattern, placed on all 4 bars.
-        assert_eq!(named(&p, "Pattern 1").notes.len(), 13);
-        assert_eq!(named(&p, "Pattern 1").len, BAR);
-        // Chords: Dm9, G13, Cmaj9, Am9, each 4 keys notes plus a bass note, one bar long.
-        let chords = named(&p, "Chords");
-        assert_eq!(chords.notes.len(), 20);
-        assert!(chords.notes.iter().all(|n| n.len == BAR && n.start % BAR == 0));
-        // Melody: 6 notes; the first is C5 at step 20 for two 16ths.
-        let melody = named(&p, "Melody");
-        assert_eq!(melody.notes.len(), 6);
-        assert!(melody.notes.iter().any(|n| (n.pitch, n.start, n.len) == (72, 20 * STEP, 2 * STEP)));
-        // Clips: 1 chord clip + 4 drum clips + 1 melody clip spanning all 4 bars.
-        assert_eq!(p.clips.len(), 6);
-        assert_eq!(p.end(), 4 * BAR);
-        // Mixer routing and channel settings carried over.
-        let bass = p.channel(channel_named(&p, "Bass")).unwrap();
-        assert_eq!(p.mixer_track(bass.mixer).unwrap().name, "Bass");
-        assert_eq!((bass.vol, bass.instrument), (s.channels[4].vol, Instrument::Bass));
+    fn track_named(p: &Project, name: &str) -> TrackId {
+        p.tracks.iter().find(|t| t.name == name).unwrap().id
+    }
+
+    fn clips_on(p: &Project, track: TrackId) -> Vec<(Tick, Tick, Tick)> {
+        let mut v: Vec<_> = p.clips.iter().filter(|c| c.track == track).map(|c| (c.start, c.len, c.offset)).collect();
+        v.sort();
+        v
     }
 
     #[test]
-    fn disabled_bars_split_clips() {
-        let mut s = Song::default();
-        s.drum_bars[0] = false;
-        s.lead_bars[1] = false;
-        let p = Project::from(&s);
-        p.validate().unwrap();
-        let track = |name: &str| p.tracks.iter().find(|t| t.name == name).unwrap().id;
-        let drums: Vec<Tick> = p.clips.iter().filter(|c| c.track == track("Drums")).map(|c| c.start).collect();
-        assert_eq!(drums, [BAR, 2 * BAR, 3 * BAR]);
-        let melody: Vec<(Tick, Tick, Tick)> = p.clips.iter().filter(|c| c.track == track("Melody")).map(|c| (c.start, c.len, c.offset)).collect();
-        assert_eq!(melody, [(0, BAR, 0), (2 * BAR, 2 * BAR, 2 * BAR)]);
-    }
-
-    /// Converting loses nothing: the drum grid, melody cells and chords can be read back.
-    #[test]
-    fn conversion_keeps_all_song_content() {
-        let mut seed = 0x2545_f491_u32;
-        let mut rand = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            seed
-        };
-        for _ in 0..50 {
-            let mut s = Song::default();
-            for row in &mut s.drums {
-                for cell in row.iter_mut() {
-                    *cell = rand() % 3 == 0;
-                }
-            }
-            for row in &mut s.melody {
-                *row = (rand() as u64) << 32 | rand() as u64;
-                *row &= (rand() as u64) << 32 | rand() as u64; // sparser
-            }
-            for c in &mut s.chords {
-                *c = rand() as usize % CHORDS.len();
-            }
-            let p = Project::from(&s);
-            p.validate().unwrap();
-
-            let drums = named(&p, "Pattern 1");
-            for (tr, row) in s.drums.iter().enumerate() {
-                let ch = channel_named(&p, CHANNEL_NAMES[tr]);
-                for (st, &on) in row.iter().enumerate() {
-                    let hit = drums.notes.iter().any(|n| n.channel == ch && n.start == st as Tick * STEP);
-                    assert_eq!(hit, on, "drum {tr} step {st}");
-                }
-            }
-
-            let mut melody = [0u64; LEAD_KEYS];
-            for n in &named(&p, "Melody").notes {
-                assert_eq!((n.start % STEP, n.len % STEP), (0, 0));
-                for st in n.start / STEP..n.end() / STEP {
-                    melody[(n.pitch - LEAD_LOW) as usize] |= 1 << st;
-                }
-            }
-            assert_eq!(melody, s.melody);
-            // Each note is a maximal run: no two notes of one pitch touch.
-            let notes = &named(&p, "Melody").notes;
-            assert!(notes.iter().all(|a| !notes.iter().any(|b| b.pitch == a.pitch && b.start == a.end())));
-
-            let (keys, chords) = (channel_named(&p, "Keys"), named(&p, "Chords"));
-            for (b, &j) in s.chords.iter().enumerate() {
-                let mut got: Vec<u8> = chords.notes.iter().filter(|n| n.channel == keys && n.start == b as Tick * BAR).map(|n| n.pitch).collect();
-                got.sort();
-                let mut want = CHORDS[j].notes.to_vec();
-                want.sort();
-                assert_eq!(got, want, "bar {b}");
-            }
+    fn chord_table_is_sane() {
+        for c in &CHORDS[1..] {
+            assert!(c.notes.iter().all(|&n| (36..=96).contains(&n)), "{}", c.name);
+            assert!((24..60).contains(&c.bass), "{}", c.name);
         }
+    }
+
+    #[test]
+    fn demo_validates_and_compiles() {
+        let p = Project::demo();
+        p.validate().unwrap();
+        assert_eq!((p.mixer.len(), p.channels.len(), p.patterns.len(), p.tracks.len(), p.clips.len()), (4, 6, 3, 3, 6));
+        let chords = named(&p, "Chords").id;
+        let found: Vec<usize> = (0..4).map(|b| p.chord_at(chords, b * BAR)).collect();
+        assert_eq!(found, [1, 2, 3, 4]);
+        let s = p.compile();
+        // 13 drum hits x 4 bars, 4 chords of 5 notes, 6 melody notes; 4 bars long.
+        assert_eq!(s.notes.len(), 13 * 4 + 20 + 6);
+        assert_eq!((s.loop_start, s.loop_end, s.bpm), (0, 4 * BAR, 80.0));
+        assert!(s.notes.windows(2).all(|w| w[0].start <= w[1].start));
+        assert!(s.notes.iter().filter(|n| n.channel == 3).all(|n| n.vel == CHORD_VEL));
+    }
+
+    #[test]
+    fn steps_toggle() {
+        let (mut p, ch, pat, ..) = tiny();
+        assert!(p.step(pat, ch, 0) && !p.step(pat, ch, 3));
+        p.toggle_step(pat, ch, 3);
+        assert!(p.step(pat, ch, 3));
+        assert!(p.pattern(pat).unwrap().notes.iter().any(|n| (n.start, n.len, n.pitch) == (3 * STEP, STEP, STEP_PITCH)));
+        p.toggle_step(pat, ch, 3);
+        p.toggle_step(pat, ch, 0);
+        assert!(p.pattern(pat).unwrap().notes.is_empty());
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn cells_join_and_split() {
+        let (mut p, ch, pat, ..) = tiny();
+        let notes = |p: &Project| {
+            let mut v: Vec<(Tick, Tick, u8)> = p.pattern(pat).unwrap().notes.iter().filter(|n| n.pitch == 72).map(|n| (n.start / STEP, n.len / STEP, n.vel)).collect();
+            v.sort();
+            v
+        };
+        p.set_cell(pat, ch, 72, 0, true);
+        p.pattern_mut(pat).unwrap().notes.iter_mut().filter(|n| n.pitch == 72).for_each(|n| n.vel = 77);
+        p.set_cell(pat, ch, 72, 2, true);
+        p.set_cell(pat, ch, 72, 1, true); // joins 0 and 2, keeping the velocity
+        assert_eq!(notes(&p), [(0, 3, 77)]);
+        p.set_cell(pat, ch, 72, 1, true); // already on
+        assert_eq!(notes(&p), [(0, 3, 77)]);
+        p.set_cell(pat, ch, 72, 1, false); // splits
+        assert_eq!(notes(&p), [(0, 1, 77), (2, 1, 77)]);
+        assert!(p.cell(pat, ch, 72, 2) && !p.cell(pat, ch, 72, 1));
+        p.set_cell(pat, ch, 72, 0, false);
+        p.set_cell(pat, ch, 72, 2, false);
+        p.set_cell(pat, ch, 72, 5, false); // already off
+        assert_eq!(notes(&p), []);
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn chords_stamp_and_detect() {
+        let mut p = Project::demo();
+        let (chords, melody) = (named(&p, "Chords").id, named(&p, "Melody").id);
+        let melody_before = named(&p, "Melody").notes.clone();
+        assert!(p.stamp_chord(chords, BAR, BAR, 6)); // Em7 on bar 2
+        assert_eq!(p.chord_at(chords, BAR), 6);
+        let bass = channel_named(&p, "Bass");
+        let bass_notes: Vec<u8> = named(&p, "Chords").notes.iter().filter(|n| n.channel == bass && n.start == BAR).map(|n| n.pitch).collect();
+        assert_eq!(bass_notes, [CHORDS[6].bass]);
+        assert!(p.stamp_chord(chords, BAR, BAR, 0)); // clear
+        assert_eq!(p.chord_at(chords, BAR), 0);
+        assert!(!named(&p, "Chords").notes.iter().any(|n| (BAR..2 * BAR).contains(&n.start)));
+        assert_eq!((p.chord_at(chords, 0), p.chord_at(chords, 2 * BAR)), (1, 3));
+        assert_eq!(p.pattern(melody).unwrap().notes, melody_before);
+        p.validate().unwrap();
+
+        let (mut q, _, pat, ..) = tiny(); // drums only: nowhere to put a chord
+        assert!(!q.stamp_chord(pat, 0, BAR, 1));
+    }
+
+    #[test]
+    fn bars_toggle_on_the_playlist() {
+        let mut p = Project::demo();
+        let (melody, drums, beat) = (track_named(&p, "Melody"), track_named(&p, "Drums"), named(&p, "Pattern 1").id);
+        // Cutting bar 2 out of the 4-bar melody clip leaves bars 1 and 3-4, at the right offsets.
+        p.toggle_bar(melody, 1, beat);
+        assert_eq!(clips_on(&p, melody), [(0, BAR, 0), (2 * BAR, 2 * BAR, 2 * BAR)]);
+        // Putting it back takes bar 2 of the melody and joins all three again.
+        p.toggle_bar(melody, 1, beat);
+        assert_eq!(clips_on(&p, melody), [(0, 4 * BAR, 0)]);
+        // One-bar drum clips repeat the pattern; they are not joined.
+        p.toggle_bar(drums, 0, beat);
+        p.toggle_bar(drums, 0, beat);
+        assert_eq!(clips_on(&p, drums), [(0, BAR, 0), (BAR, BAR, 0), (2 * BAR, BAR, 0), (3 * BAR, BAR, 0)]);
+        // Past the end, a track repeats its nearest pattern; an empty track uses the fallback.
+        p.toggle_bar(drums, 6, named(&p, "Chords").id);
+        assert_eq!(p.clip_at(drums, 6 * BAR).unwrap().pattern, beat);
+        let empty = p.add_track("Empty");
+        p.toggle_bar(empty, 2, beat);
+        assert_eq!(clips_on(&p, empty), [(2 * BAR, BAR, 0)]);
+        assert_eq!(p.compile().loop_end, 7 * BAR);
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn pattern_position_follows_clips() {
+        let mut p = Project::demo();
+        let (beat, melody) = (named(&p, "Pattern 1").id, named(&p, "Melody").id);
+        assert_eq!(p.pattern_pos(beat, BAR + 3 * STEP), Some(3 * STEP));
+        assert_eq!(p.pattern_pos(melody, 2 * BAR + 5), Some(2 * BAR + 5));
+        assert_eq!(p.pattern_pos(beat, 4 * BAR), None);
+        p.tracks.iter_mut().for_each(|t| t.mute = true);
+        assert_eq!(p.pattern_pos(beat, 0), None);
     }
 
     #[test]
@@ -654,16 +789,6 @@ mod tests {
         assert!(s.notes.is_empty());
         assert_eq!((s.loop_start, s.loop_end), (BAR, 2 * BAR));
         assert_eq!(Project::default().compile().loop_end, BAR);
-    }
-
-    #[test]
-    fn demo_song_compiles() {
-        let s = Project::from(&Song::default()).compile();
-        // 13 drum hits x 4 bars, 4 chords of 5 notes, 6 melody notes; 4 bars long.
-        assert_eq!(s.notes.len(), 13 * 4 + 20 + 6);
-        assert_eq!((s.loop_start, s.loop_end), (0, 4 * BAR));
-        assert!(s.notes.windows(2).all(|w| w[0].start <= w[1].start));
-        assert!(s.notes.iter().filter(|n| n.channel == 3).all(|n| n.vel == CHORD_VEL));
     }
 
     #[test]
