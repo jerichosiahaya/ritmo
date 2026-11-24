@@ -10,6 +10,7 @@
 
 use crate::engine::{ChannelMix, FX_NEUTRAL, Fx, MAX_CHANNELS, MAX_MIXER, MixerMix, SeqNote, Snapshot, pan_gains};
 pub use crate::engine::{Instrument, PPQ, STEP, Tick};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Longest song the playlist allows.
@@ -43,7 +44,7 @@ pub const CHORDS: &[Chord] = &[
 macro_rules! ids {
     ($($(#[$doc:meta])* $name:ident),* $(,)?) => {$(
         $(#[$doc])*
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
         pub struct $name(pub u32);
     )*};
 }
@@ -61,7 +62,7 @@ ids!(
     ClipId,
 );
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Channel {
     pub id: ChannelId,
     pub name: String,
@@ -73,7 +74,7 @@ pub struct Channel {
     pub mixer: MixerId,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct MixerTrack {
     pub id: MixerId,
     pub name: String,
@@ -82,7 +83,7 @@ pub struct MixerTrack {
     pub mute: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Note {
     pub id: NoteId,
     pub channel: ChannelId,
@@ -98,7 +99,7 @@ impl Note {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Pattern {
     pub id: PatternId,
     pub name: String,
@@ -107,7 +108,7 @@ pub struct Pattern {
     pub notes: Vec<Note>,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Track {
     pub id: TrackId,
     pub name: String,
@@ -116,7 +117,7 @@ pub struct Track {
 
 /// Plays pattern ticks `offset .. offset + len` from `start` on the playlist.
 /// Past the pattern's end the clip is silent (no looping).
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Clip {
     pub id: ClipId,
     pub track: TrackId,
@@ -132,7 +133,7 @@ impl Clip {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub bpm: f32,
     /// Share of each 8th-note pair given to the first 16th: 0.5 = straight, 0.75 = hard swing.
@@ -554,13 +555,31 @@ impl Project {
         }
     }
 
+    /// The built-in instruments (Kick, Snare, Hat, Keys, Bass, Lead) on mixer tracks Drums, Keys,
+    /// Bass and Lead.
+    fn add_instruments(&mut self) -> Vec<ChannelId> {
+        let mix: Vec<MixerId> = ["Drums", "Keys", "Bass", "Lead"].iter().filter_map(|n| self.add_mixer_track(n)).collect();
+        let channels = [("Kick", Instrument::Kick, 0), ("Snare", Instrument::Snare, 0), ("Hat", Instrument::Hat, 0), ("Keys", Instrument::Rhodes, 1), ("Bass", Instrument::Bass, 2), ("Lead", Instrument::Rhodes, 3)];
+        channels.iter().filter_map(|&(name, inst, m)| self.add_channel(name, inst, mix[m])).collect()
+    }
+
+    /// A new, empty song: the built-in instruments, one empty one-bar pattern and three empty
+    /// playlist tracks.
+    pub fn blank() -> Project {
+        let mut p = Project { bpm: 90.0, ..Project::default() };
+        p.add_instruments();
+        p.add_pattern("Pattern 1", p.bar_len());
+        for i in 1..=3 {
+            p.add_track(&format!("Track {i}"));
+        }
+        p
+    }
+
     /// A short lo-fi loop: drums, four chords with bass, and a melody, over four bars.
     pub fn demo() -> Project {
         let mut p = Project { bpm: 80.0, swing: 0.6, master: Fx { tone: 0.55, crush: 0.2, wobble: 0.35, vinyl: 0.4, reverb: 0.3, volume: 0.8 }, ..Project::default() };
         let bar = p.bar_len();
-        let mix: Vec<MixerId> = ["Drums", "Keys", "Bass", "Lead"].iter().filter_map(|n| p.add_mixer_track(n)).collect();
-        let channels = [("Kick", Instrument::Kick, 0), ("Snare", Instrument::Snare, 0), ("Hat", Instrument::Hat, 0), ("Keys", Instrument::Rhodes, 1), ("Bass", Instrument::Bass, 2), ("Lead", Instrument::Rhodes, 3)];
-        let ch: Vec<ChannelId> = channels.iter().filter_map(|&(name, inst, m)| p.add_channel(name, inst, mix[m])).collect();
+        let ch = p.add_instruments();
 
         let drums = p.add_pattern("Pattern 1", bar);
         for (c, row) in ch.iter().zip(["x......x..x.....", "....x.......x...", "x.x.x.x.x.x.x.x."]) {
@@ -652,6 +671,16 @@ mod tests {
         assert_eq!((s.loop_start, s.loop_end, s.bpm), (0, 4 * BAR, 80.0));
         assert!(s.notes.windows(2).all(|w| w[0].start <= w[1].start));
         assert!(s.notes.iter().filter(|n| n.channel == 3).all(|n| n.vel == CHORD_VEL));
+    }
+
+    #[test]
+    fn blank_project_is_valid_and_silent() {
+        let p = Project::blank();
+        p.validate().unwrap();
+        assert_eq!((p.channels.len(), p.mixer.len(), p.patterns.len(), p.tracks.len(), p.clips.len()), (6, 4, 1, 3, 0));
+        let s = p.compile();
+        assert!(s.notes.is_empty());
+        assert_eq!((s.loop_start, s.loop_end), (0, BAR));
     }
 
     #[test]

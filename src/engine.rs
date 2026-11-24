@@ -6,6 +6,7 @@
 //! to the UI thread to be freed there, so the audio thread never allocates or frees memory.
 
 use std::f32::consts::{FRAC_PI_4, SQRT_2, TAU};
+use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 
 /// Vinyl hiss and crackle fade in on play and out on stop over this many seconds,
@@ -16,7 +17,7 @@ const VINYL_FADE: f32 = 0.25;
 // Time and the snapshot the engine plays.
 
 /// Master insert: the lo-fi chain, plus master volume.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Fx {
     pub tone: f32,
     pub crush: f32,
@@ -44,7 +45,7 @@ pub const METERS: usize = MAX_MIXER + 1;
 const VOICES: usize = 32;
 
 /// Built-in instruments.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Instrument {
     Kick,
     Snare,

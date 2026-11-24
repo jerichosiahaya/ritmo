@@ -1,4 +1,5 @@
 mod engine;
+mod file;
 mod project;
 mod rt;
 mod widgets;
@@ -8,8 +9,10 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{self, Color32, Key, RichText};
 use engine::{Cmd, Engine, Instrument, METERS, Snapshot, STEP};
 use project::{CHORDS, ChannelId, PatternId, Project, Tick, TrackId};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 use widgets::*;
 
 /// Holds the audio stream open. `pos` is the playing tick + 1 (0 = stopped);
@@ -101,8 +104,41 @@ const WINDOWS: [(Win, &str, Key); 4] = [
     (Win::Mixer, "☰ Mixer", Key::F9),
 ];
 
+/// What to do once unsaved changes are dealt with.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Then {
+    Nothing,
+    New { demo: bool },
+    Open,
+    Quit,
+}
+
+/// A file dialog's answer, from its thread.
+enum Dialog {
+    Open(Option<PathBuf>),
+    SaveAs(Option<PathBuf>, Then),
+}
+
+/// How often the project is autosaved while it changes.
+const AUTOSAVE_EVERY: Duration = Duration::from_secs(60);
+
 struct App {
     project: Project,
+    /// The file the project was opened from or saved to.
+    path: Option<PathBuf>,
+    /// The project as last saved or opened; anything else is unsaved.
+    saved: Project,
+    /// The project as last autosaved.
+    autosaved: Option<Project>,
+    last_autosave: Instant,
+    /// An open file dialog.
+    dialog_rx: Option<mpsc::Receiver<Dialog>>,
+    /// Waiting for an answer to "Save changes?" before doing this.
+    ask_save: Option<Then>,
+    /// The user confirmed closing the window.
+    quitting: bool,
+    /// Window title as last set.
+    title: String,
     /// The project as last sent to the engine, and its compiled form (the windows draw previews
     /// from it).
     sent: Option<Project>,
@@ -133,15 +169,18 @@ struct App {
 }
 
 impl App {
-    fn new(project: Project, audio: Option<Audio>, status: String) -> Self {
-        let has_notes = |p: &project::Pattern, f: &dyn Fn(Instrument) -> bool| p.notes.iter().any(|n| project.channel(n.channel).is_some_and(|c| f(c.instrument)));
-        let pattern = project.patterns.iter().find(|p| has_notes(p, &Instrument::is_drum)).or(project.patterns.first()).map_or(PatternId(0), |p| p.id);
-        // The piano roll starts on the last melodic channel (the lead in the demo).
-        let roll_ch = project.channels.iter().rev().find(|c| !c.instrument.is_drum()).or(project.channels.first()).map_or(ChannelId(0), |c| c.id);
-        let roll_pat = project.patterns.iter().find(|p| p.notes.iter().any(|n| n.channel == roll_ch)).map_or(pattern, |p| p.id);
+    fn new(project: Project, path: Option<PathBuf>, audio: Option<Audio>, status: String) -> Self {
         let mut app = App {
-            sel_track: project.tracks.first().map(|t| t.id),
-            project,
+            sel_track: None,
+            saved: Project::default(),
+            project: Project::default(),
+            path: None,
+            autosaved: None,
+            last_autosave: Instant::now(),
+            dialog_rx: None,
+            ask_save: None,
+            quitting: false,
+            title: String::new(),
             sent: None,
             snap: Snapshot::default(),
             playing: false,
@@ -151,17 +190,241 @@ impl App {
             open: [true, true, false, false],
             meters: [0.0; METERS],
             sel_bar: 0,
-            pattern,
-            roll: (roll_pat, roll_ch),
+            pattern: PatternId(0),
+            roll: (PatternId(0), ChannelId(0)),
             roll_low: 60,
-            live: roll_ch,
+            live: ChannelId(0),
             roll_paint: None,
             preview: None,
             cur: None,
         };
-        app.edit_in_roll(roll_pat, roll_ch);
-        app.open[Win::Roll as usize] = false;
+        app.set_project(project, path);
         app
+    }
+
+    /// Starts on `project`, read from `path` if it came from a file: resets the selections and
+    /// counts it as saved.
+    fn set_project(&mut self, project: Project, path: Option<PathBuf>) {
+        let has_notes = |p: &project::Pattern, f: &dyn Fn(Instrument) -> bool| p.notes.iter().any(|n| project.channel(n.channel).is_some_and(|c| f(c.instrument)));
+        let pattern = project.patterns.iter().find(|p| has_notes(p, &Instrument::is_drum)).or(project.patterns.first()).map_or(PatternId(0), |p| p.id);
+        // The piano roll starts on the last melodic channel (the lead in the demo).
+        let roll_ch = project.channels.iter().rev().find(|c| !c.instrument.is_drum()).or(project.channels.first()).map_or(ChannelId(0), |c| c.id);
+        let roll_pat = project.patterns.iter().find(|p| p.notes.iter().any(|n| n.channel == roll_ch)).map_or(pattern, |p| p.id);
+        self.sel_track = project.tracks.first().map(|t| t.id);
+        self.sel_bar = 0;
+        self.pattern = pattern;
+        self.saved = project.clone();
+        self.project = project;
+        self.path = path;
+        let roll_open = self.is_open(Win::Roll);
+        self.edit_in_roll(roll_pat, roll_ch);
+        self.open[Win::Roll as usize] = roll_open;
+    }
+
+    fn dirty(&self) -> bool {
+        self.project != self.saved
+    }
+
+    fn file_name(&self) -> String {
+        self.path.as_ref().and_then(|p| p.file_name()).map_or("Untitled".into(), |n| n.to_string_lossy().into_owned())
+    }
+
+    /// Runs `then`, first asking to save unsaved changes.
+    fn request(&mut self, ctx: &egui::Context, then: Then) {
+        if self.dirty() { self.ask_save = Some(then) } else { self.run(ctx, then) }
+    }
+
+    fn run(&mut self, ctx: &egui::Context, then: Then) {
+        match then {
+            Then::Nothing => {}
+            Then::New { demo } => {
+                self.set_project(if demo { Project::demo() } else { Project::blank() }, None);
+                self.status = if demo { "New project from the demo song".into() } else { "New empty project".into() };
+            }
+            Then::Open => {
+                let dir = self.dialog_dir();
+                self.file_dialog(move || Dialog::Open(rfd::FileDialog::new().set_title("Open project").add_filter("Ritmo project", &[file::EXTENSION]).set_directory(dir).pick_file()));
+            }
+            Then::Quit => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Saves to the current file (or asks where), then runs `then`.
+    fn save(&mut self, ctx: &egui::Context, then: Then) {
+        match self.path.clone() {
+            Some(path) => {
+                if self.write(&path) {
+                    self.run(ctx, then);
+                }
+            }
+            None => self.save_as(then),
+        }
+    }
+
+    fn save_as(&mut self, then: Then) {
+        let (dir, name) = (self.dialog_dir(), format!("{}.{}", self.path.as_ref().and_then(|p| p.file_stem()).map_or("Untitled".into(), |s| s.to_string_lossy().into_owned()), file::EXTENSION));
+        self.file_dialog(move || {
+            let picked = rfd::FileDialog::new().set_title("Save project").add_filter("Ritmo project", &[file::EXTENSION]).set_directory(dir).set_file_name(name).save_file();
+            Dialog::SaveAs(picked.map(file::with_extension), then)
+        });
+    }
+
+    /// Writes the project to `path`; false (with the reason in the status bar) if it failed.
+    fn write(&mut self, path: &Path) -> bool {
+        match file::save(path, &self.project) {
+            Ok(()) => {
+                self.saved = self.project.clone();
+                self.path = Some(path.to_path_buf());
+                self.status = format!("Saved {}", path.display());
+                true
+            }
+            Err(e) => {
+                self.status = format!("Could not save {}: {e}", path.display());
+                false
+            }
+        }
+    }
+
+    fn open_file(&mut self, path: PathBuf) {
+        match file::load(&path) {
+            Ok(p) => {
+                self.status = format!("Opened {}", path.display());
+                self.set_project(p, Some(path));
+            }
+            Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
+        }
+    }
+
+    /// Folder the file dialogs start in: the project's, else ~/Music, else home.
+    fn dialog_dir(&self) -> PathBuf {
+        if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) {
+            return dir.to_path_buf();
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
+        let music = home.join("Music");
+        if music.is_dir() { music } else { home }
+    }
+
+    /// Shows a system file dialog on another thread so the window keeps drawing.
+    fn file_dialog(&mut self, show: impl FnOnce() -> Dialog + Send + 'static) {
+        if self.dialog_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.dialog_rx = Some(rx);
+        self.status = "Waiting for the file dialog…".into();
+        std::thread::spawn(move || {
+            let _ = tx.send(show());
+        });
+    }
+
+    /// Handles a closed file dialog.
+    fn dialog_done(&mut self, ctx: &egui::Context, d: Dialog) {
+        match d {
+            Dialog::Open(Some(path)) => self.open_file(path),
+            Dialog::SaveAs(Some(path), then) => {
+                if self.write(&path) {
+                    self.run(ctx, then);
+                }
+            }
+            // Also what comes back when the desktop has no file chooser at all.
+            Dialog::Open(None) | Dialog::SaveAs(None, _) => {
+                self.status = "No file chosen. (No dialog appeared? Install xdg-desktop-portal-gtk, -gnome or -kde, or zenity.)".into();
+            }
+        }
+    }
+
+    /// Writes the autosave file if the project changed since the last one.
+    fn autosave(&mut self) {
+        if self.autosaved.as_ref() == Some(&self.project) {
+            return;
+        }
+        match file::autosave(&self.project) {
+            Ok(_) => self.autosaved = Some(self.project.clone()),
+            Err(e) => self.status = format!("Autosave failed: {e}"),
+        }
+        self.last_autosave = Instant::now();
+    }
+
+    /// File shortcuts: Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as.
+    fn file_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{KeyboardShortcut as K, Modifiers as M};
+        let hit = |m, k| ctx.input_mut(|i| i.consume_shortcut(&K::new(m, k)));
+        // Shift first: Ctrl+S also matches Ctrl+Shift+S.
+        if hit(M::COMMAND | M::SHIFT, Key::S) {
+            self.save_as(Then::Nothing);
+        } else if hit(M::COMMAND, Key::S) {
+            self.save(ctx, Then::Nothing);
+        } else if hit(M::COMMAND, Key::O) {
+            self.request(ctx, Then::Open);
+        } else if hit(M::COMMAND, Key::N) {
+            self.request(ctx, Then::New { demo: false });
+        }
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let item = |ui: &mut egui::Ui, text: &str, keys: &str| ui.add(egui::Button::new(text).shortcut_text(keys));
+        ui.menu_button("File", |ui| {
+            if item(ui, "New empty project", "Ctrl+N").clicked() {
+                self.request(&ctx, Then::New { demo: false });
+            }
+            if item(ui, "New from demo song", "").clicked() {
+                self.request(&ctx, Then::New { demo: true });
+            }
+            if item(ui, "Open…", "Ctrl+O").clicked() {
+                self.request(&ctx, Then::Open);
+            }
+            ui.separator();
+            if item(ui, "Save", "Ctrl+S").clicked() {
+                self.save(&ctx, Then::Nothing);
+            }
+            if item(ui, "Save as…", "Ctrl+Shift+S").clicked() {
+                self.save_as(Then::Nothing);
+            }
+            ui.separator();
+            if let Some(path) = file::autosave_path() {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let shown = path.display().to_string().replacen(&home, "~", 1);
+                ui.label(RichText::new(format!("Autosaved every minute to\n{shown}")).small().weak());
+            }
+        })
+        .response
+        .on_hover_text("New, open and save projects");
+    }
+
+    /// "Save changes?" before New, Open or quitting with unsaved changes.
+    fn ask_save_modal(&mut self, ctx: &egui::Context) {
+        let Some(then) = self.ask_save else { return };
+        let name = self.file_name();
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::unique("ask-save")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading(format!("Save changes to {name}?"));
+            ui.label("If you don't save, the changes since the last save are lost.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Don't save").clicked() {
+                    choice = Some(false);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.ask_save = None;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.ask_save = None;
+        }
+        if let Some(save) = choice {
+            self.ask_save = None;
+            if save { self.save(ctx, then) } else { self.run(ctx, then) }
+        }
     }
 
     /// Queue a command for the audio thread without blocking. False if there is no audio
@@ -218,9 +481,10 @@ impl App {
     fn export(&mut self) {
         let snap = self.project.compile();
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let dir = std::path::Path::new(&home).join("Music");
-        let dir = if dir.is_dir() { dir } else { std::path::PathBuf::from(".") };
-        let path = dir.join("ritmo-export.wav");
+        let dir = Path::new(&home).join("Music");
+        let dir = if dir.is_dir() { dir } else { PathBuf::from(".") };
+        let stem = self.path.as_ref().and_then(|p| p.file_stem()).map_or("ritmo-export".into(), |s| s.to_string_lossy().into_owned());
+        let path = dir.join(format!("{stem}.wav"));
         let (tx, rx) = mpsc::channel();
         self.status = "Exporting…".into();
         self.export_rx = Some(rx);
@@ -238,7 +502,11 @@ impl App {
             return;
         }
         for ev in ctx.input(|i| i.events.clone()) {
-            let egui::Event::Key { key, pressed, repeat: false, .. } = ev else { continue };
+            let egui::Event::Key { key, pressed, repeat: false, modifiers, .. } = ev else { continue };
+            // Ctrl/Alt combinations are shortcuts, not notes.
+            if modifiers.command || modifiers.ctrl || modifiers.alt {
+                continue;
+            }
             if let Some(&(w, _, _)) = WINDOWS.iter().find(|(_, _, k)| *k == key) {
                 if pressed {
                     self.open[w as usize] ^= true;
@@ -255,6 +523,7 @@ impl App {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
             ui.label(RichText::new("◆ RITMO").strong().size(18.0).color(ACCENT));
+            self.file_menu(ui);
             ui.separator();
             if ui.add(egui::Button::selectable(self.playing, RichText::new("▶").size(16.0))).on_hover_text("Play (Space)").clicked() {
                 self.set_playing(true);
@@ -358,6 +627,23 @@ pub fn chord_color(j: usize) -> Color32 {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Closing with unsaved changes asks first.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+            if self.dirty() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.ask_save = Some(Then::Quit);
+            } else {
+                self.quitting = true;
+            }
+        }
+        if self.quitting {
+            self.autosave();
+        }
+        if let Some(d) = self.dialog_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.dialog_rx = None;
+            self.dialog_done(&ctx, d);
+        }
+        self.file_shortcuts(&ctx);
         self.handle_keys(&ctx);
         if let Some(msg) = self.export_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.status = msg;
@@ -405,6 +691,16 @@ impl eframe::App for App {
             .inner;
 
         windows::show(self, &ctx, area);
+        self.ask_save_modal(&ctx);
+
+        let title = format!("{}{} — Ritmo", if self.dirty() { "• " } else { "" }, self.file_name());
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+        if self.last_autosave.elapsed() >= AUTOSAVE_EVERY {
+            self.autosave();
+        }
 
         // Send the project whenever it changed. If the queue was full, `sent` stays stale and it
         // goes out on the next frame.
@@ -420,7 +716,11 @@ impl eframe::App for App {
             }
         }
         if self.playing || self.export_rx.is_some() || self.meters.iter().any(|&m| m > 1e-3) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else if self.dialog_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        } else {
+            ctx.request_repaint_after(AUTOSAVE_EVERY);
         }
     }
 }
@@ -439,7 +739,12 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             apply_theme(&cc.egui_ctx);
-            Ok(Box::new(App::new(Project::demo(), audio, status)))
+            // `ritmo song.ritmo` opens that file; otherwise start with the demo song.
+            let mut app = App::new(Project::demo(), None, audio, status);
+            if let Some(path) = std::env::args_os().nth(1) {
+                app.open_file(PathBuf::from(path));
+            }
+            Ok(Box::new(app))
         }),
     )
 }

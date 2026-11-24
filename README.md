@@ -17,11 +17,19 @@ cargo run --release
 
 Knobs: drag up/down, scroll, or use the arrow keys; double-click resets.
 
+## Files
+
+- **File** menu: New (empty or the demo song), Open, Save, Save as. Projects are `.ritmo` files (readable JSON). `ritmo song.ritmo` opens a file from the terminal.
+- The title bar shows `•` when there are unsaved changes; New, Open and closing the window ask before discarding them.
+- Ritmo autosaves every minute to `~/.local/share/ritmo/autosave.ritmo` (or `$XDG_DATA_HOME/ritmo/`). Open that file if Ritmo ever closes unexpectedly.
+- Open and Save use your desktop's file dialog through xdg-desktop-portal (install `xdg-desktop-portal-gtk`, `-gnome` or `-kde`), or `zenity` if no portal is running.
+
 ## Keys
 
 - `Z S X D C V G B H N J M` = C3 octave, `Q 2 W 3 E R 5 T 6 Y 7 U I 9 O 0 P` = C4 octave, played on the selected channel (outlined in the Channel Rack; the status bar names it).
 - **Space** = play/stop. **F5 / F6 / F7 / F9** = Playlist / Channel Rack / Piano Roll / Mixer.
-- **Export** writes `~/Music/ritmo-export.wav` (the song twice plus a 2 s tail).
+- **Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S** = new / open / save / save as.
+- **Export** writes `~/Music/<project name>.wav` (or `ritmo-export.wav` before the first save): the song twice plus a 2 s tail.
 
 Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian/Ubuntu).
 
