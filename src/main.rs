@@ -1,4 +1,5 @@
 mod engine;
+mod project;
 mod widgets;
 mod windows;
 

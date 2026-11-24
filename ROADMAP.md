@@ -238,7 +238,7 @@ gantt
 
 | Week | Dates | Work |
 |---|---|---|
-| 1 | 25 Nov – 1 Dec | CI (build, test, clippy); new project model with IDs, next to `Song` |
+| 1 | 25 Nov – 1 Dec | CI (build, test, clippy); new project model with IDs, next to `Song` ✅ |
 | 2 | 2 – 8 Dec | Engine reads the new model through snapshots with deferred freeing; `assert_no_alloc` in debug builds |
 | 3 | 9 – 15 Dec | Save/open `.ritmo` files with a format version; autosave |
 | 4 | 16 – 22 Dec | Undo/redo (commands for steps, notes, clips, mixer) |

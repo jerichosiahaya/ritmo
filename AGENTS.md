@@ -16,6 +16,7 @@ Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian
 ## Layout
 
 - `src/engine.rs`: everything audio, with no I/O and no UI. It holds the synths (drums, FM Rhodes, sine bass), the step and melody sequencer, the mixer (channels → buses → master) and the lo-fi master chain. `render_offline` and `export_wav` use the same engine as live playback.
+- `src/project.rs`: the v0.2 project model (channels, mixer tracks, patterns with notes, playlist tracks and clips, all with stable IDs; time in ticks, `PPQ` = 96). It sits next to `Song` until the engine and UI move onto it (roadmap week 2). `Project::from(&song)` converts the old song, and `validate()` checks every invariant. Keep `validate()` and its tests in step with any new field.
 - `src/main.rs`: app state (`App`), the cpal audio stream, toolbar, browser panel, keyboard shortcuts.
 - `src/windows.rs`: the floating windows (Playlist, Channel Rack, Piano Roll, Mixer).
 - `src/widgets.rs`: theme colors and custom widgets (knob, LED, step button, meter, LCD).
