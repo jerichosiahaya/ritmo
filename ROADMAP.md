@@ -245,8 +245,8 @@ gantt
 | 1 | 25 Nov – 1 Dec | CI (build, test, clippy); new project model with IDs, next to `Song` ✅ |
 | 2 | 2 – 8 Dec | Engine reads the new model through snapshots with deferred freeing; `assert_no_alloc` in debug builds ✅ (done early, 24 Nov; a small heap guard in `rt.rs` instead of the crate; the UI edits the project model too) |
 | 3 | 9 – 15 Dec | Save/open `.ritmo` files with a format version; autosave ✅ (done early, 24 Nov) |
-| 4 | 16 – 22 Dec | **Chop sampler, engine and files:** load WAV/FLAC/MP3/OGG, chop instrument (slices as notes), auto-chop at hits or in even slices, project format 2 |
-| 5 | 23 – 29 Dec | **Chop sampler window:** waveform with draggable chop points, tap-to-chop, 16 pads on the keyboard, per-pad pitch, reverse and level; holiday buffer |
+| 4 | 16 – 22 Dec | **Chop sampler, engine and files:** load WAV/FLAC/MP3/OGG, chop instrument (slices as notes), auto-chop at hits or in even slices, project format 2 ✅ (done early, 24 Nov) |
+| 5 | 23 – 29 Dec | **Chop sampler window:** waveform with draggable chop points, tap-to-chop, 16 pads on the keyboard, per-pad pitch, reverse and level; holiday buffer ✅ (done early, 24 Nov) |
 | 6 | 30 Dec – 5 Jan | Undo/redo (commands for steps, notes, clips, chops, mixer); new/rename/clone/delete patterns |
 | 7 | 6 – 12 Jan | Free-form playlist: place, move, resize, copy, delete clips; longer songs; loop range |
 | 8 | 13 – 19 Jan | Piano roll: note length, velocity, selection, copy/paste, snap; metronome; octave shift; audio settings |

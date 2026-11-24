@@ -2,7 +2,8 @@
 //! `app.project` through its editing operations and draw previews from `app.snap`.
 
 use crate::engine::*;
-use crate::project::{CHORDS, Clip, Note, PatternId, Project};
+use crate::project::{CHOP_BASE, CHORDS, ChannelId, Clip, MAX_SLICES, Note, PatternId, Project};
+use crate::sample;
 use crate::widgets::*;
 use crate::{App, Win, channel_color, chord_color, pattern_color};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
@@ -28,11 +29,13 @@ pub fn show(app: &mut App, ctx: &egui::Context, area: Rect) {
         (Some(c), Some(p)) => format!("Piano Roll — {} · {}", c.name, p.name),
         _ => "Piano Roll".into(),
     };
-    let specs: [(Win, &str, Pos2, [f32; 2]); 4] = [
+    let chop_title = app.chop_ch.and_then(|c| app.project.channel(c)).map_or("Sampler".into(), |c| format!("Sampler — {}", c.name));
+    let specs: [(Win, &str, Pos2, [f32; 2]); 5] = [
         (Win::Playlist, "Playlist", o + vec2(16.0, 16.0), [700.0, 190.0]),
         (Win::Rack, "Channel Rack", o + vec2(16.0, 250.0), [560.0, 250.0]),
         (Win::Roll, &roll_title, o + vec2(80.0, 60.0), [760.0, 420.0]),
         (Win::Mixer, "Mixer", o + vec2(600.0, 250.0), [620.0, 270.0]),
+        (Win::Chop, &chop_title, o + vec2(120.0, 40.0), [760.0, 430.0]),
     ];
     for (w, title, pos, size) in specs {
         let mut open = app.is_open(w);
@@ -49,6 +52,7 @@ pub fn show(app: &mut App, ctx: &egui::Context, area: Rect) {
                 Win::Rack => rack(app, ui),
                 Win::Roll => piano_roll(app, ui),
                 Win::Mixer => mixer(app, ui),
+                Win::Chop => sampler(app, ui),
             });
         if !open {
             app.open[w as usize] = false;
@@ -92,10 +96,16 @@ fn rack(app: &mut App, ui: &mut Ui) {
                 let fill = color.gamma_multiply(if c.mute { 0.4 } else { 0.9 });
                 let outline = if app.live == id { Stroke::new(1.5, ACCENT_HOT) } else { Stroke::NONE };
                 let btn = egui::Button::new(RichText::new(&name).color(CLIP_TEXT).strong()).fill(fill).stroke(outline).min_size(vec2(84.0, 26.0));
-                let hint = if inst.is_drum() { "Click to play it from the keyboard" } else { "Open in the piano roll" };
+                let hint = match inst {
+                    _ if inst.is_drum() => "Click to play it from the keyboard",
+                    Instrument::Chop => "Open in the Sampler",
+                    _ => "Open in the piano roll",
+                };
                 if ui.add(btn).on_hover_text(hint).clicked() {
                     if inst.is_drum() {
                         app.live = id;
+                    } else if inst == Instrument::Chop {
+                        app.select_chop(id);
                     } else {
                         app.edit_channel(id);
                     }
@@ -158,6 +168,7 @@ fn piano_roll(app: &mut App, ui: &mut Ui) {
         return;
     };
     let (ch_name, color) = (channel.name.clone(), channel_color(app.project.channel_index(ch).unwrap_or(0)));
+    let is_chop = channel.instrument == Instrument::Chop;
     let ch_index = app.project.channel_index(ch).map_or(u16::MAX, |i| i as u16);
     let steps = ((pattern.len / STEP) as usize).max(STEPS_PER_BAR);
     ui.horizontal(|ui| {
@@ -227,22 +238,28 @@ fn piano_roll(app: &mut App, ui: &mut Ui) {
         // Rows and keyboard.
         for k in 0..ROLL_KEYS {
             let pitch = low + (ROLL_KEYS - 1 - k) as u8;
+            // Chop pads aren't notes of a scale: every row is a plain row.
+            let black = !is_chop && is_black(pitch);
             let y = grid.top() + k as f32 * ROW_H;
             let row = Rect::from_min_size(Pos2::new(grid.left(), y), vec2(grid.width(), ROW_H));
-            p.rect_filled(row, 0, if is_black(pitch) { Color32::from_rgb(36, 40, 45) } else { Color32::from_rgb(47, 52, 58) });
+            p.rect_filled(row, 0, if black { Color32::from_rgb(36, 40, 45) } else { Color32::from_rgb(47, 52, 58) });
             // Black keys are shorter, drawn over the white key area like a real keyboard.
-            let key_w = if is_black(pitch) { (KEY_W - 2.0) * 0.62 } else { KEY_W - 2.0 };
+            let key_w = if black { (KEY_W - 2.0) * 0.62 } else { KEY_W - 2.0 };
             let key = Rect::from_min_size(Pos2::new(rect.left(), y), vec2(key_w, ROW_H));
-            if is_black(pitch) {
+            if black {
                 p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), y), vec2(KEY_W - 2.0, ROW_H)), 0, Color32::from_rgb(222, 222, 216));
             }
-            let fill = match (is_black(pitch), app.preview == Some(pitch)) {
+            let fill = match (black, app.preview == Some(pitch)) {
                 (_, true) => ACCENT,
                 (true, _) => Color32::from_rgb(28, 28, 30),
                 (false, _) => Color32::from_rgb(222, 222, 216),
             };
             p.rect_filled(key.shrink2(vec2(0.0, 0.5)), 1, fill);
-            if pitch.is_multiple_of(12) {
+            if is_chop {
+                if let Some(pad) = pitch.checked_sub(CHOP_BASE).filter(|&k| (k as usize) < MAX_SLICES) {
+                    p.text(key.right_center() - vec2(4.0, 0.0), Align2::RIGHT_CENTER, format!("Pad {}", pad + 1), FontId::proportional(9.0), Color32::from_gray(60));
+                }
+            } else if pitch.is_multiple_of(12) {
                 p.text(key.right_center() - vec2(4.0, 0.0), Align2::RIGHT_CENTER, note_name(pitch), FontId::proportional(10.0), Color32::from_gray(60));
             }
         }
@@ -506,6 +523,231 @@ fn strip(ui: &mut Ui, name: &str, color: Color32, fader: &mut f32, level: f32) {
             });
             let db = 20.0 * fader.log10();
             ui.label(RichText::new(if db.is_finite() { format!("{db:+.1} dB") } else { "-inf".into() }).small().monospace());
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sampler (chop)
+
+/// Typing-keyboard key for pad `k` (pitch `CHOP_BASE + k`).
+const PAD_KEYS: [&str; 16] = ["Z", "S", "X", "D", "C", "V", "G", "B", "H", "N", "J", "M", "Q", "2", "W", "3"];
+const WAVE_H: f32 = 150.0;
+const PAD: f32 = 52.0;
+
+fn sampler(app: &mut App, ui: &mut Ui) {
+    let chops: Vec<(ChannelId, String)> = app.project.channels.iter().filter(|c| c.chop.is_some()).map(|c| (c.id, c.name.clone())).collect();
+    let current = app.chop_ch.filter(|id| chops.iter().any(|(c, _)| c == id));
+    ui.horizontal(|ui| {
+        if ui.button("📂 Load sample…").on_hover_text("Load WAV, FLAC, MP3, OGG or AIFF as a new chop channel (or drop files on the window)").clicked() {
+            app.load_sample_dialog();
+        }
+        if chops.len() > 1 {
+            let name = current.and_then(|id| chops.iter().find(|(c, _)| *c == id)).map_or("—".to_string(), |(_, n)| n.clone());
+            egui::ComboBox::from_id_salt("chop-channel").selected_text(name).show_ui(ui, |ui| {
+                for (id, n) in &chops {
+                    if ui.selectable_label(current == Some(*id), n).clicked() {
+                        app.select_chop(*id);
+                    }
+                }
+            });
+        }
+    });
+    let Some(ch) = current else {
+        ui.add_space(30.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("Drop an audio file here, or load one, to chop it onto 16 pads.").size(15.0));
+            ui.label(RichText::new("It is chopped at its hits automatically; then play the pads with Z S X D C V G B H N J M Q 2 W 3.").weak());
+        });
+        return;
+    };
+    let Some(chop) = app.project.chop(ch).cloned() else { return };
+    let index = app.project.channel_index(ch).map_or(u16::MAX, |i| i as u16);
+    let loaded = app.chop_sample(ch).map(|l| (l.data.sr, l.data.frames.len(), l.overview.clone()));
+    let name = chop.path.file_name().map_or_else(|| chop.path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let Some((sr, frames, overview)) = loaded else {
+        let why = match app.samples.get(&chop.path) {
+            Some(Err(e)) if e != "loading…" => format!("Can't play {name}: {e}"),
+            _ => format!("Loading {name}…"),
+        };
+        ui.label(RichText::new(why).color(ACCENT_HOT));
+        return;
+    };
+
+    // Chop controls.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&name).strong()).on_hover_text(chop.path.display().to_string());
+        ui.label(RichText::new(format!("{:.1} s · {} pads", frames as f32 / sr as f32, chop.slices.len())).weak());
+        ui.separator();
+        let tapping = app.tap.is_some();
+        ui.add_enabled_ui(!tapping, |ui| {
+            if ui.button("Chop at hits").on_hover_text("Find the hits and put a chop at each (up to 16)").clicked()
+                && let Some(l) = app.chop_sample(ch)
+            {
+                let points = sample::detect_hits(&l.data, app.sensitivity, MAX_SLICES);
+                app.project.set_chop_points(ch, &points);
+            }
+            ui.add(egui::Slider::new(&mut app.sensitivity, 0.0..=1.0).show_value(false).text("sensitivity")).on_hover_text("Higher finds softer hits");
+            for n in [8, 16] {
+                if ui.button(format!("{n} slices")).on_hover_text(format!("Cut into {n} equal slices")).clicked() {
+                    app.project.set_chop_points(ch, &sample::even_points(chop.len, n));
+                }
+            }
+        });
+        let tap_label = if tapping { "● Tap (Enter)" } else { "Tap to chop" };
+        let tap = ui.add(egui::Button::selectable(tapping, tap_label)).on_hover_text("Plays the sample; tap Enter (or this button) where each chop starts. Esc ends.");
+        if tap.clicked() {
+            if tapping { app.tap() } else { app.start_tap(ch) }
+        }
+        if tapping && ui.button("Done").on_hover_text("Stop and chop at the taps (Esc)").clicked() {
+            app.finish_tap();
+        }
+    });
+
+    // Waveform with slices and chop points.
+    let width = ui.available_width().max(200.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, WAVE_H), Sense::click_and_drag());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 3, BG_DEEP);
+    let x_of = |f: u32| rect.left() + f as f32 / frames.max(1) as f32 * rect.width();
+    let frame_at = |x: f32| (((x - rect.left()) / rect.width()).clamp(0.0, 1.0) * frames as f32) as u32;
+    for (k, s) in chop.slices.iter().enumerate() {
+        let r = Rect::from_min_max(Pos2::new(x_of(s.start), rect.top()), Pos2::new(x_of(s.end), rect.bottom()));
+        let base = channel_color(k);
+        let fill = if k == app.chop_sel { base.gamma_multiply(0.35) } else { base.gamma_multiply(if k % 2 == 0 { 0.12 } else { 0.07 }) };
+        p.rect_filled(r, 0, fill);
+        p.text(r.left_top() + vec2(4.0, 3.0), Align2::LEFT_TOP, format!("{}", k + 1), FontId::proportional(12.0), base);
+        if s.reverse || s.pitch != 0.0 {
+            let tag = format!("{}{}", if s.reverse { "◀ " } else { "" }, if s.pitch != 0.0 { format!("{:+.0}", s.pitch) } else { String::new() });
+            p.text(r.left_bottom() + vec2(4.0, -3.0), Align2::LEFT_BOTTOM, tag, FontId::proportional(10.0), base);
+        }
+    }
+    let mid = rect.center().y;
+    let cols = rect.width() as usize;
+    for c in 0..cols {
+        let (a, b) = (c * overview.len() / cols, ((c + 1) * overview.len() / cols).max(c * overview.len() / cols + 1));
+        let [lo, hi] = overview[a.min(overview.len() - 1)..b.min(overview.len())].iter().fold([0.0f32, 0.0f32], |[lo, hi], [l, h]| [lo.min(*l), hi.max(*h)]);
+        let x = rect.left() + c as f32 + 0.5;
+        p.line_segment([Pos2::new(x, mid - hi * WAVE_H * 0.48), Pos2::new(x, mid - lo * WAVE_H * 0.48)], Stroke::new(1.0, Color32::from_gray(185)));
+    }
+    let points: Vec<u32> = chop.slices.iter().map(|s| s.start).collect();
+    for &pt in &points {
+        let x = x_of(pt);
+        p.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(1.5, ACCENT));
+        p.add(egui::Shape::convex_polygon(vec![Pos2::new(x - 5.0, rect.top()), Pos2::new(x + 5.0, rect.top()), Pos2::new(x, rect.top() + 8.0)], ACCENT, Stroke::NONE));
+    }
+    if let Some(t) = &app.tap {
+        let x = x_of((t.started.elapsed().as_secs_f64() * t.sr as f64) as u32);
+        p.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], Stroke::new(2.0, ACCENT_HOT));
+        for &f in &t.points {
+            p.line_segment([Pos2::new(x_of(f), rect.top()), Pos2::new(x_of(f), rect.bottom())], Stroke::new(1.5, ACCENT_HOT));
+        }
+    }
+    // Interaction: drag a chop point (grab within 6 px), click a slice to play and select it,
+    // double-click to add a chop point, right-click a point to remove it.
+    let near = |x: f32| points.iter().enumerate().map(|(k, &pt)| (k, (x_of(pt) - x).abs())).filter(|&(_, d)| d <= 6.0).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(k, _)| k);
+    if app.tap.is_none() {
+        if resp.drag_started() {
+            app.chop_drag = resp.interact_pointer_pos().and_then(|p| near(p.x));
+        }
+        if let (Some(k), Some(pos)) = (app.chop_drag, resp.interact_pointer_pos()) {
+            app.project.move_chop_point(ch, k, frame_at(pos.x));
+        }
+        if resp.drag_stopped() {
+            app.chop_drag = None;
+        }
+        if let Some(pos) = resp.interact_pointer_pos() {
+            if resp.double_clicked() {
+                app.project.add_chop_point(ch, frame_at(pos.x));
+            } else if resp.clicked() {
+                let f = frame_at(pos.x);
+                if let Some(k) = chop.slices.iter().position(|s| (s.start..s.end).contains(&f)) {
+                    app.chop_sel = k;
+                    app.live = ch;
+                    app.send(Cmd::NoteOn { channel: index, pitch: CHOP_BASE + k as u8 });
+                    app.after_send.push(Cmd::NoteOff { channel: index, pitch: CHOP_BASE + k as u8 });
+                }
+            } else if resp.secondary_clicked()
+                && let Some(k) = near(pos.x)
+            {
+                app.project.remove_chop_point(ch, k);
+            }
+        }
+    }
+    resp.on_hover_text("Click a slice to hear it · drag a chop point · double-click to add one · right-click a point to remove it");
+
+    ui.add_space(6.0);
+    ui.horizontal_top(|ui| {
+        // Pads, 4 x 4 with pad 1 at the bottom left.
+        let (grid, _) = ui.allocate_exact_size(vec2(4.0 * PAD + 12.0, 4.0 * PAD + 12.0), Sense::hover());
+        for (k, key) in PAD_KEYS.iter().enumerate() {
+            let (row, col) = (3 - k / 4, k % 4);
+            let r = Rect::from_min_size(grid.min + vec2(col as f32 * (PAD + 4.0), row as f32 * (PAD + 4.0)), vec2(PAD, PAD));
+            let exists = k < chop.slices.len();
+            let resp = ui.interact(r, ui.scope_id().with(("pad", k)), if exists { Sense::click() } else { Sense::hover() });
+            let pitch = CHOP_BASE + k as u8;
+            if resp.is_pointer_button_down_on() && exists && app.preview != Some(pitch) {
+                app.send(Cmd::NoteOn { channel: index, pitch });
+                (app.preview, app.chop_sel, app.live) = (Some(pitch), k, ch);
+            } else if resp.clicked() && app.preview != Some(pitch) {
+                // Pressed and released within one frame (a quick tap): play it once.
+                app.send(Cmd::NoteOn { channel: index, pitch });
+                app.after_send.push(Cmd::NoteOff { channel: index, pitch });
+                (app.chop_sel, app.live) = (k, ch);
+            }
+            if !resp.is_pointer_button_down_on() && app.preview == Some(pitch) {
+                app.send(Cmd::NoteOff { channel: index, pitch });
+                app.preview = None;
+            }
+            let base = channel_color(k);
+            let fill = match (exists, app.preview == Some(pitch), k == app.chop_sel) {
+                (false, _, _) => BG_DEEP,
+                (true, true, _) => base,
+                (true, false, true) => base.gamma_multiply(0.6),
+                _ => base.gamma_multiply(0.3),
+            };
+            let p = ui.painter();
+            p.rect_filled(r, 5, fill);
+            if k == app.chop_sel && exists {
+                p.rect_stroke(r, 5, Stroke::new(2.0, ACCENT_HOT), StrokeKind::Inside);
+            }
+            let text = if exists { Color32::from_gray(235) } else { Color32::from_gray(80) };
+            p.text(r.left_top() + vec2(6.0, 5.0), Align2::LEFT_TOP, format!("{}", k + 1), FontId::proportional(15.0), text);
+            p.text(r.right_bottom() - vec2(6.0, 5.0), Align2::RIGHT_BOTTOM, *key, FontId::monospace(11.0), text.gamma_multiply(0.7));
+            let label = format!("Pad {} (key {key})", k + 1);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, exists, &label));
+            if exists {
+                resp.on_hover_text(format!("{label}: click to play"));
+            }
+        }
+
+        ui.add_space(10.0);
+        ui.vertical(|ui| {
+            let k = app.chop_sel.min(chop.slices.len().saturating_sub(1));
+            ui.label(RichText::new(format!("Pad {} · key {}", k + 1, PAD_KEYS[k])).strong());
+            let s = chop.slices[k];
+            ui.label(RichText::new(format!("{:.3} – {:.3} s", s.start as f32 / sr as f32, s.end as f32 / sr as f32)).weak().monospace());
+            ui.add_space(4.0);
+            if let Some(slice) = app.project.slice_mut(ch, k) {
+                egui::Grid::new("pad-knobs").spacing(vec2(16.0, 2.0)).show(ui, |ui| {
+                    knob(ui, &mut slice.pitch, -24.0..=24.0, 0.0, "Pitch (semitones)", ACCENT);
+                    knob(ui, &mut slice.gain, 0.0..=2.0, 1.0, "Level", ACCENT);
+                    ui.end_row();
+                    ui.label(RichText::new(format!("{:+.0} st", slice.pitch)).small());
+                    ui.label(RichText::new("Level").small());
+                });
+                slice.pitch = slice.pitch.round();
+                ui.checkbox(&mut slice.reverse, "Reverse").on_hover_text("Play this pad backwards");
+            }
+            ui.separator();
+            if let Some(c) = app.project.channels.iter_mut().find(|c| c.id == ch).and_then(|c| c.chop.as_mut()) {
+                ui.checkbox(&mut c.one_shot, "One-shot").on_hover_text("Play the whole slice however short the note is");
+                ui.checkbox(&mut c.cut_itself, "Cut itself").on_hover_text("A new pad hit stops the chop that is still playing");
+            }
+            ui.add_space(4.0);
+            if ui.button("Edit pattern in piano roll").on_hover_text("Each row is a pad").clicked() {
+                app.edit_channel(ch);
+            }
         });
     });
 }

@@ -16,7 +16,7 @@ const FORMAT: &str = "ritmo";
 /// File format version this build writes. When a saved field changes shape or meaning: bump it,
 /// add an upgrade step to `migrate`, and run `cargo test -- --ignored write_fixture` to add a
 /// fixture under `tests/files/` that every later version must keep opening.
-pub const VERSION: u64 = 1;
+pub const VERSION: u64 = 2;
 
 #[derive(Debug)]
 pub enum FileError {
@@ -71,8 +71,10 @@ pub fn from_str(text: &str) -> Result<Project, FileError> {
     Ok(project)
 }
 
-/// Upgrades a document saved in format `from` to `VERSION`, one step per version. Each format
-/// change adds a step, e.g. `if from < 2 { /* rewrite doc["project"] from 1 to 2 */ }`.
+/// Upgrades a document saved in format `from` to `VERSION`, one step per version.
+///
+/// - 1 → 2: channels gained optional chop settings (`chop`); version 1 files have none, so
+///   nothing needs rewriting.
 fn migrate(_doc: &mut Value, from: u64) -> Result<(), FileError> {
     if from < 1 {
         return Err(FileError::Broken(format!("unknown file format {from}")));
@@ -131,7 +133,19 @@ pub fn autosave(p: &Project) -> Result<PathBuf, FileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::{ChannelId, PatternId, STEP};
+    use crate::project::{CHOP_BASE, ChannelId, PatternId, STEP};
+
+    /// The demo plus a chop channel (its audio file need not exist) playing pad 2.
+    fn with_chops() -> Project {
+        let mut p = Project::demo();
+        let ch = p.add_chop_channel("Break", PathBuf::from("samples/break.wav"), 88200).unwrap();
+        p.set_chop_points(ch, &[0, 22050, 44100, 66150]);
+        p.slice_mut(ch, 1).unwrap().pitch = 3.0;
+        p.slice_mut(ch, 2).unwrap().reverse = true;
+        let beat = p.patterns[0].id;
+        p.add_note(beat, ch, CHOP_BASE + 1, 0, STEP, 100);
+        p
+    }
 
     fn fixtures() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/files")
@@ -152,7 +166,7 @@ mod tests {
         edited.loop_range = Some((0, 384));
         edited.tracks[1].mute = true;
         edited.channels[2].pan = -0.37;
-        for p in [Project::demo(), Project::blank(), Project::default(), edited] {
+        for p in [Project::demo(), Project::blank(), Project::default(), with_chops(), edited] {
             let text = to_string(&p);
             let back = from_str(&text).unwrap();
             assert_eq!(back, p);
@@ -231,14 +245,21 @@ mod tests {
         let v1 = load(&fixtures().join("format-1-demo.ritmo")).unwrap();
         assert_eq!(v1.compile().notes.len(), 13 * 4 + 20 + 6);
         assert!(v1.step(PatternId(11), ChannelId(5), 0) && v1.bar_len() == 16 * STEP);
+        // Format 2 added chop channels.
+        let v2 = load(&fixtures().join("format-2-chops.ritmo")).unwrap();
+        let chop = v2.channels.iter().find_map(|c| c.chop.as_ref()).unwrap();
+        assert_eq!((chop.slices.len(), chop.slices[1].pitch, chop.slices[2].reverse), (4, 3.0, true));
+        // Files without chops don't mention them.
+        assert!(!to_string(&Project::demo()).contains("chop"));
     }
 
     /// Writes the fixture for the current format version. Run after bumping `VERSION`.
     #[test]
-    #[ignore = "writes tests/files/format-<VERSION>-demo.ritmo"]
+    #[ignore = "writes tests/files/format-<VERSION>-chops.ritmo"]
     fn write_fixture() {
-        let path = fixtures().join(format!("format-{VERSION}-demo.{EXTENSION}"));
+        // Version 1's fixture is format-1-demo.ritmo (the demo song alone).
+        let path = fixtures().join(format!("format-{VERSION}-chops.{EXTENSION}"));
         fs::create_dir_all(fixtures()).unwrap();
-        save(&path, &Project::demo()).unwrap();
+        save(&path, &with_chops()).unwrap();
     }
 }

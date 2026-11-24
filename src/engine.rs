@@ -7,7 +7,7 @@
 
 use std::f32::consts::{FRAC_PI_4, SQRT_2, TAU};
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 /// Vinyl hiss and crackle fade in on play and out on stop over this many seconds,
 /// so a stopped engine is silent.
@@ -43,6 +43,12 @@ pub const MAX_MIXER: usize = 16;
 pub const MASTER: usize = MAX_MIXER;
 pub const METERS: usize = MAX_MIXER + 1;
 const VOICES: usize = 32;
+const CHOP_VOICES: usize = 32;
+/// Chop pads: pad `k` (from 0) plays at pitch `CHOP_BASE + k`, so pad 1 is C3 (`Z` on the
+/// typing keyboard).
+pub const CHOP_BASE: u8 = 48;
+/// Most slices (pads) one chop channel has.
+pub const MAX_SLICES: usize = 16;
 
 /// Built-in instruments.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -54,6 +60,8 @@ pub enum Instrument {
     Rhodes,
     /// Sine bass (one note at a time).
     Bass,
+    /// Chop sampler: plays slices of an audio file, one per pad.
+    Chop,
 }
 
 impl Instrument {
@@ -70,6 +78,45 @@ pub struct ChannelMix {
     pub mute: bool,
     /// Index into `Snapshot::mixer`.
     pub mixer: usize,
+    /// Index into `Snapshot::chops` for `Instrument::Chop` channels.
+    pub chop: Option<usize>,
+}
+
+/// Decoded audio, stereo, at the file's own sample rate.
+#[derive(Clone, PartialEq, Default)]
+pub struct SampleData {
+    pub sr: u32,
+    pub frames: Vec<[f32; 2]>,
+}
+
+impl std::fmt::Debug for SampleData {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "SampleData({} frames at {} Hz)", self.frames.len(), self.sr)
+    }
+}
+
+/// One chop: a slice of the sample played by one pad.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SliceMix {
+    /// Frames of the sample, `start..end`.
+    pub start: u32,
+    pub end: u32,
+    /// Playback speed from the slice's pitch (2.0 = an octave up).
+    pub speed: f32,
+    pub reverse: bool,
+    pub gain: f32,
+}
+
+/// A chop channel's sample and slices. The sample is shared with the UI; the engine never drops
+/// the last reference because it leaves with the snapshot through the trash queue.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ChopMix {
+    pub sample: Option<Arc<SampleData>>,
+    pub slices: Vec<SliceMix>,
+    /// Play the whole slice whatever the note length (otherwise the note's end fades it out).
+    pub one_shot: bool,
+    /// A new pad hit fades out the channel's sounding chops.
+    pub cut_itself: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -101,6 +148,7 @@ pub struct Snapshot {
     pub mixer: Vec<MixerMix>,
     /// Sorted by start.
     pub notes: Vec<SeqNote>,
+    pub chops: Vec<ChopMix>,
     /// Playback runs `loop_start..loop_end`, then wraps.
     pub loop_start: Tick,
     pub loop_end: Tick,
@@ -108,7 +156,7 @@ pub struct Snapshot {
 
 impl Default for Snapshot {
     fn default() -> Self {
-        Snapshot { bpm: 120.0, swing: 0.5, fx: FX_NEUTRAL, channels: Vec::new(), mixer: Vec::new(), notes: Vec::new(), loop_start: 0, loop_end: 4 * PPQ }
+        Snapshot { bpm: 120.0, swing: 0.5, fx: FX_NEUTRAL, channels: Vec::new(), mixer: Vec::new(), notes: Vec::new(), chops: Vec::new(), loop_start: 0, loop_end: 4 * PPQ }
     }
 }
 
@@ -207,6 +255,56 @@ impl Voice {
         self.tph = (self.tph + self.freq * 14.0 * dt).fract();
         self.t += dt;
         out
+    }
+}
+
+/// One sounding chop.
+#[derive(Clone, Copy, Default)]
+struct ChopVoice {
+    active: bool,
+    gate: bool,
+    live: bool,
+    channel: u16,
+    /// Index into `Snapshot::chops`.
+    chop: u16,
+    note: u8,
+    end: Tick,
+    /// Read position in sample frames; moves by `step` per output frame (negative in reverse).
+    pos: f64,
+    step: f64,
+    /// Where the slice ends (the lower bound when reversed).
+    stop: f64,
+    gain: f32,
+    /// Fade-in and release envelope, 0..1.
+    env: f32,
+    /// Seconds since the start, for the declick fade-in.
+    t: f32,
+    /// Fading out after note-off or a cut, per output frame.
+    release: f32,
+}
+
+impl ChopVoice {
+    /// Stereo output for one frame, reading `data` with linear interpolation.
+    fn tick(&mut self, data: &SampleData, dt: f32) -> [f32; 2] {
+        let len = data.frames.len();
+        let remaining = if self.step >= 0.0 { self.stop - self.pos } else { self.pos - self.stop };
+        if remaining <= 0.0 || len < 2 || self.env < 1e-4 {
+            self.active = false;
+            return [0.0; 2];
+        }
+        // 2 ms fade in, and fade out over the last 3 ms of the slice, so chops never click.
+        let edge = (remaining / self.step.abs() * dt as f64 / 0.003).min(1.0) as f32;
+        let fade_in = (self.t / 0.002).min(1.0);
+        if self.release > 0.0 {
+            self.env *= self.release;
+        }
+        let i = (self.pos.max(0.0) as usize).min(len - 2);
+        let frac = (self.pos - i as f64).clamp(0.0, 1.0) as f32;
+        let (a, b) = (data.frames[i], data.frames[i + 1]);
+        let g = self.gain * self.env * edge * fade_in;
+        self.pos += self.step;
+        self.t += dt;
+        [(a[0] + (b[0] - a[0]) * frac) * g, (a[1] + (b[1] - a[1]) * frac) * g]
     }
 }
 
@@ -407,7 +505,11 @@ pub struct Engine {
     rng: Rng,
     chans: [ChanState; MAX_CHANNELS],
     voices: [Voice; VOICES],
+    chop_voices: [ChopVoice; CHOP_VOICES],
     rel_coef: f32,
+    /// Per-frame release multipliers for chops: after note-off (10 ms) and when cut (5 ms).
+    chop_release: f32,
+    chop_cut: f32,
     fx: [FxChain; 2],
     /// 0..1 gain on the vinyl noise: ramps to 1 while playing, to 0 when stopped.
     vinyl_amt: f32,
@@ -431,7 +533,10 @@ impl Engine {
             rng: Rng(0x1234_5678),
             chans: [ChanState::default(); MAX_CHANNELS],
             voices: [Voice::default(); VOICES],
+            chop_voices: [ChopVoice::default(); CHOP_VOICES],
             rel_coef: (-1.0 / (0.25 * sr)).exp(),
+            chop_release: (-1.0 / (0.01 * sr)).exp(),
+            chop_cut: (-1.0 / (0.005 * sr)).exp(),
             fx: [FxChain::new(sr, 0, 0x9e37_79b9), FxChain::new(sr, 23, 0x7f4a_7c15)],
             vinyl_amt: 0.0,
             peaks: [0.0; METERS],
@@ -448,6 +553,13 @@ impl Engine {
         match cmd {
             Cmd::Snapshot(s) => {
                 let old = std::mem::replace(&mut self.snap, s);
+                // Chops whose sample was replaced or removed stop at once.
+                for v in self.chop_voices.iter_mut().filter(|v| v.active) {
+                    let sample = |s: &Snapshot| s.chops.get(v.chop as usize).and_then(|c| c.sample.as_ref()).map(Arc::as_ptr);
+                    if sample(&old).is_none() || sample(&old) != sample(&self.snap) {
+                        v.active = false;
+                    }
+                }
                 self.retire(old);
                 let n = self.snap.channels.len();
                 for v in self.voices.iter_mut().filter(|v| v.channel as usize >= n) {
@@ -476,6 +588,9 @@ impl Engine {
                 }
                 if let Some(c) = self.chans.get_mut(channel as usize).filter(|c| c.live && c.note == pitch) {
                     c.gate = false;
+                }
+                for v in self.chop_voices.iter_mut().filter(|v| v.live && v.channel == channel && v.note == pitch) {
+                    v.gate = false;
                 }
             }
         }
@@ -506,6 +621,37 @@ impl Engine {
         for c in self.chans.iter_mut().filter(|c| !c.live) {
             c.gate = false;
         }
+        for v in self.chop_voices.iter_mut().filter(|v| !v.live) {
+            v.gate = false;
+        }
+    }
+
+    /// Starts slice `pitch - CHOP_BASE` of the channel's chop.
+    fn chop_on(&mut self, channel: u16, chop: usize, pitch: u8, g: f32, end: Tick, live: bool) {
+        let Some(c) = self.snap.chops.get(chop) else { return };
+        let (Some(data), Some(slice)) = (&c.sample, pitch.checked_sub(CHOP_BASE).and_then(|k| c.slices.get(k as usize))) else { return };
+        let (start, stop) = (slice.start.min(slice.end) as f64, (slice.end as usize).min(data.frames.len()) as f64);
+        if stop <= start {
+            return;
+        }
+        if c.cut_itself {
+            for v in self.chop_voices.iter_mut().filter(|v| v.active && v.channel == channel) {
+                v.release = self.chop_cut;
+            }
+        }
+        let step = data.sr as f64 / self.sr as f64 * slice.speed as f64;
+        let (pos, step, stop) = if slice.reverse { (stop - 1.0, -step, start) } else { (start, step, stop) };
+        // A free voice, otherwise the one closest to silence.
+        let i = self.chop_voices.iter().position(|v| !v.active).unwrap_or_else(|| {
+            let mut best = 0;
+            for (i, v) in self.chop_voices.iter().enumerate() {
+                if v.env < self.chop_voices[best].env {
+                    best = i;
+                }
+            }
+            best
+        });
+        self.chop_voices[i] = ChopVoice { active: true, gate: true, live, channel, chop: chop as u16, note: pitch, end, pos, step, stop, gain: slice.gain * g, env: 1.0, t: 0.0, release: 0.0 };
     }
 
     fn note_on(&mut self, channel: u16, pitch: u8, vel: u8, end: Tick, live: bool) {
@@ -518,6 +664,11 @@ impl Engine {
                 st.hit_vel = g;
             }
             Instrument::Bass => *st = ChanState { note: pitch, freq: midi_hz(pitch), t: 0.0, gate: true, live, amp: 1.0, vel: g, end, ..*st },
+            Instrument::Chop => {
+                if let Some(chop) = mix.chop {
+                    self.chop_on(channel, chop, pitch, g, end, live);
+                }
+            }
             Instrument::Rhodes => {
                 // Free voice first, otherwise steal the oldest.
                 let i = self.voices.iter().position(|v| !v.active).unwrap_or_else(|| {
@@ -546,6 +697,9 @@ impl Engine {
         }
         for c in self.chans.iter_mut().filter(|c| c.gate && !c.live && c.end <= t) {
             c.gate = false;
+        }
+        for v in self.chop_voices.iter_mut().filter(|v| v.gate && !v.live && v.end <= t) {
+            v.gate = false;
         }
         while let Some(&n) = self.snap.notes.get(self.cursor) {
             if n.start > t {
@@ -577,22 +731,39 @@ impl Engine {
 
         let (dt, rc) = (self.dt, self.rel_coef);
         let n = self.snap.channels.len().min(MAX_CHANNELS);
-        let mut ch = [0.0f32; MAX_CHANNELS];
+        let mut ch = [[0.0f32; 2]; MAX_CHANNELS];
         for (i, out) in ch.iter_mut().enumerate().take(n) {
-            *out = self.chans[i].render(self.snap.channels[i].instrument, dt, rc, &mut self.rng);
+            let x = self.chans[i].render(self.snap.channels[i].instrument, dt, rc, &mut self.rng);
+            *out = [x, x];
         }
         for v in self.voices.iter_mut().filter(|v| v.active) {
             let out = v.tick(dt, rc);
             if let Some(c) = ch.get_mut(v.channel as usize) {
-                *c += out;
+                c[0] += out;
+                c[1] += out;
+            }
+        }
+        for v in self.chop_voices.iter_mut().filter(|v| v.active) {
+            let Some(data) = self.snap.chops.get(v.chop as usize).and_then(|c| c.sample.as_deref()) else {
+                v.active = false;
+                continue;
+            };
+            let one_shot = self.snap.chops[v.chop as usize].one_shot;
+            if !v.gate && !one_shot && v.release == 0.0 {
+                v.release = self.chop_release;
+            }
+            let [l, r] = v.tick(data, dt);
+            if let Some(c) = ch.get_mut(v.channel as usize) {
+                c[0] += l;
+                c[1] += r;
             }
         }
 
         let mut bus = [[0.0f32; 2]; MAX_MIXER];
-        for (c, &x) in self.snap.channels.iter().zip(&ch).filter(|(c, _)| !c.mute) {
+        for (c, &[l, r]) in self.snap.channels.iter().zip(&ch).filter(|(c, _)| !c.mute) {
             let b = &mut bus[c.mixer.min(MAX_MIXER - 1)];
-            b[0] += x * c.gain[0];
-            b[1] += x * c.gain[1];
+            b[0] += l * c.gain[0];
+            b[1] += r * c.gain[1];
         }
         let mut mix = [0.0; 2];
         for (m, (mx, [l, r])) in self.snap.mixer.iter().zip(bus).enumerate().filter(|(_, (mx, _))| !mx.mute) {
@@ -652,7 +823,7 @@ mod tests {
     /// One mixer track, the given channels, these notes, a 1-bar loop.
     fn snap(instruments: &[Instrument], notes: &[SeqNote]) -> Snapshot {
         Snapshot {
-            channels: instruments.iter().map(|&instrument| ChannelMix { instrument, gain: UNITY, mute: false, mixer: 0 }).collect(),
+            channels: instruments.iter().map(|&instrument| ChannelMix { instrument, gain: UNITY, mute: false, mixer: 0, chop: None }).collect(),
             mixer: vec![MixerMix { gain: UNITY, mute: false }],
             notes: notes.to_vec(),
             ..Snapshot::default()
@@ -661,6 +832,25 @@ mod tests {
 
     fn note(channel: u16, pitch: u8, start: Tick, len: Tick) -> SeqNote {
         SeqNote { start, end: start + len, channel, pitch, vel: 100 }
+    }
+
+    /// One chop channel playing `data` cut into `slices` (start, end) at normal speed.
+    fn chop_snap(data: SampleData, slices: &[(u32, u32)], one_shot: bool, cut_itself: bool) -> Snapshot {
+        let mut s = snap(&[Instrument::Chop], &[]);
+        s.channels[0].chop = Some(0);
+        let slices = slices.iter().map(|&(start, end)| SliceMix { start, end, speed: 1.0, reverse: false, gain: 1.0 }).collect();
+        s.chops.push(ChopMix { sample: Some(Arc::new(data)), slices, one_shot, cut_itself });
+        s
+    }
+
+    fn sine(sr: u32, n: usize, hz: f32) -> Vec<[f32; 2]> {
+        (0..n).map(|i| [(std::f32::consts::TAU * hz * i as f32 / sr as f32).sin() * 0.5; 2]).collect()
+    }
+
+    /// First and last frame (from now) with sound, within `max` frames.
+    fn span(e: &mut Engine, max: usize) -> Option<(usize, usize)> {
+        let loud: Vec<usize> = (0..max).filter(|_| e.next_frame()[0].abs() > 1e-3).collect();
+        Some((*loud.first()?, *loud.last()?))
     }
 
     fn engine(s: &Snapshot, sr: f32) -> Engine {
@@ -901,7 +1091,11 @@ mod tests {
         const SNAPS: usize = 200;
         let (tx, rx) = command_channel();
         let (trash_tx, trash_rx) = trash_channel();
-        let base = demo();
+        let mut base = demo();
+        // Plus a chop channel (index 6) with a sample.
+        let chop = chop_snap(SampleData { sr: 44100, frames: sine(44100, 44100, 220.0) }, &[(0, 20000), (20000, 44100)], true, true);
+        base.channels.push(ChannelMix { chop: Some(0), ..chop.channels[0] });
+        base.chops = chop.chops;
         let mut e = Engine::new(22050.0).with_trash(trash_tx);
         // Like the app's UI thread: build snapshots, try_send them, free what comes back.
         let ui = std::thread::spawn(move || {
@@ -926,10 +1120,11 @@ mod tests {
                 send(Cmd::Snapshot(Box::new(s)));
                 send(Cmd::NoteOn { channel: 5, pitch: 60 + (i % 12) as u8 });
                 send(Cmd::NoteOff { channel: 5, pitch: 60 + (i % 12) as u8 });
+                send(Cmd::NoteOn { channel: 6, pitch: CHOP_BASE + (i % 2) as u8 });
             }
             trash_rx
         });
-        let total = 1 + SNAPS * 3;
+        let total = 1 + SNAPS * 4;
         let mut got = 0;
         let before = rt::violations();
         rt::enter();
@@ -948,6 +1143,122 @@ mod tests {
         assert_eq!(rt::violations() - before, 0, "audio path allocated or freed memory");
         assert_eq!(e.leaked, 0);
         assert!(e.playing && (e.snap.bpm - (80.0 + (SNAPS - 1) as f32 * 0.1)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn chop_pads_play_their_slices() {
+        let mut frames = sine(8000, 2000, 400.0);
+        frames.extend(vec![[0.0; 2]; 2000]);
+        let s = chop_snap(SampleData { sr: 8000, frames }, &[(0, 2000), (2000, 4000)], true, true);
+        let hit = |pitch| {
+            let mut e = Engine::new(8000.0);
+            e.handle(Cmd::Snapshot(Box::new(s.clone())));
+            e.handle(Cmd::NoteOn { channel: 0, pitch });
+            peak(&mut e, 1500)[0]
+        };
+        assert!(hit(CHOP_BASE) > 0.1);
+        assert!(hit(CHOP_BASE + 1) < 1e-3, "pad 2 is the silent slice");
+        assert!(hit(CHOP_BASE + 5) < 1e-3, "no pad 6");
+        assert!(hit(CHOP_BASE - 1) < 1e-3);
+    }
+
+    #[test]
+    fn chop_length_follows_pitch_and_sample_rate() {
+        let len = |sample_sr: u32, speed: f32| {
+            let mut s = chop_snap(SampleData { sr: sample_sr, frames: sine(sample_sr, 1000, 300.0) }, &[(0, 1000)], true, true);
+            s.chops[0].slices[0].speed = speed;
+            let mut e = Engine::new(8000.0);
+            e.handle(Cmd::Snapshot(Box::new(s)));
+            e.handle(Cmd::NoteOn { channel: 0, pitch: CHOP_BASE });
+            let (a, b) = span(&mut e, 4000).unwrap();
+            (b - a) as f32
+        };
+        assert!((len(8000, 1.0) - 1000.0).abs() < 30.0, "{}", len(8000, 1.0));
+        assert!((len(8000, 2.0) - 500.0).abs() < 30.0, "an octave up plays twice as fast");
+        assert!((len(16000, 1.0) - 500.0).abs() < 30.0, "16 kHz audio at 8 kHz");
+    }
+
+    #[test]
+    fn reversed_chops_start_from_the_end() {
+        // Silence, then a burst at the end of the slice.
+        let mut frames = vec![[0.0; 2]; 900];
+        frames.extend(sine(8000, 100, 400.0));
+        let onset_of = |reverse| {
+            let mut s = chop_snap(SampleData { sr: 8000, frames: frames.clone() }, &[(0, 1000)], true, true);
+            s.chops[0].slices[0].reverse = reverse;
+            let mut e = Engine::new(8000.0);
+            e.handle(Cmd::Snapshot(Box::new(s)));
+            e.handle(Cmd::NoteOn { channel: 0, pitch: CHOP_BASE });
+            span(&mut e, 3000).unwrap().0
+        };
+        let (fwd, rev) = (onset_of(false), onset_of(true));
+        assert!(rev + 500 < fwd, "forward {fwd}, reverse {rev}");
+    }
+
+    #[test]
+    fn gated_chops_stop_with_the_note_and_one_shots_do_not() {
+        let tail = |one_shot| {
+            let mut s = chop_snap(SampleData { sr: 8000, frames: sine(8000, 8000, 300.0) }, &[(0, 8000)], one_shot, true);
+            s.notes = vec![note(0, CHOP_BASE, 0, STEP)]; // a 16th: 1000 frames at 120 BPM
+            s.loop_end = 16 * PPQ;
+            let mut e = engine(&s, 8000.0);
+            peak(&mut e, 2000);
+            peak(&mut e, 500)[0]
+        };
+        assert!(tail(false) < 1e-3);
+        assert!(tail(true) > 0.1);
+    }
+
+    #[test]
+    fn chops_cut_themselves() {
+        let voices = |cut| {
+            let s = chop_snap(SampleData { sr: 8000, frames: sine(8000, 8000, 300.0) }, &[(0, 4000), (4000, 8000)], true, cut);
+            let mut e = Engine::new(8000.0);
+            e.handle(Cmd::Snapshot(Box::new(s)));
+            e.handle(Cmd::NoteOn { channel: 0, pitch: CHOP_BASE });
+            peak(&mut e, 100);
+            e.handle(Cmd::NoteOn { channel: 0, pitch: CHOP_BASE + 1 });
+            // The cut chop fades to silence in about 50 ms.
+            peak(&mut e, 600);
+            e.chop_voices.iter().filter(|v| v.active).count()
+        };
+        assert_eq!(voices(true), 1);
+        assert_eq!(voices(false), 2);
+    }
+
+    #[test]
+    fn chops_keep_stereo() {
+        let frames: Vec<[f32; 2]> = sine(8000, 2000, 300.0).into_iter().map(|[l, _]| [l, 0.0]).collect();
+        let s = chop_snap(SampleData { sr: 8000, frames }, &[(0, 2000)], true, true);
+        let mut e = Engine::new(8000.0);
+        e.handle(Cmd::Snapshot(Box::new(s)));
+        e.handle(Cmd::NoteOn { channel: 0, pitch: CHOP_BASE });
+        let p = peak(&mut e, 1500);
+        assert!(p[0] > 0.1 && p[1] < 1e-3, "{p:?}");
+    }
+
+    #[test]
+    fn replacing_the_sample_stops_its_chops() {
+        let s = chop_snap(SampleData { sr: 8000, frames: sine(8000, 8000, 300.0) }, &[(0, 8000)], true, true);
+        let sounding = |next: Snapshot| {
+            let mut e = Engine::new(8000.0);
+            e.handle(Cmd::Snapshot(Box::new(s.clone())));
+            e.handle(Cmd::NoteOn { channel: 0, pitch: CHOP_BASE });
+            peak(&mut e, 100);
+            e.handle(Cmd::Snapshot(Box::new(next)));
+            e.chop_voices.iter().any(|v| v.active)
+        };
+        // Same sample (only the level changed): keeps playing.
+        let mut same = s.clone();
+        same.channels[0].gain = [0.5, 0.5];
+        assert!(sounding(same));
+        // A different sample, or none: stops.
+        let mut other = s.clone();
+        other.chops[0].sample = Some(Arc::new((*s.chops[0].sample.clone().unwrap()).clone()));
+        assert!(!sounding(other));
+        let mut gone = s.clone();
+        gone.chops.clear();
+        assert!(!sounding(gone));
     }
 
     #[test]

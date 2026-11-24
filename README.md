@@ -13,6 +13,7 @@ cargo run --release
 - **Playlist (F5):** tracks of pattern clips. Click an empty bar to place the track's pattern there; click a clip to select a bar, double-click to edit it, right-click to put a chord on that bar or cut the bar out. Click a track name to mute it. Chord bars show the chord's name.
 - **Channel Rack (F6):** for each channel, an on/off LED, pan and volume knobs, and step buttons for drums (in the pattern picked at the top); melodic channels show what they play across the song.
 - **Piano Roll (F7):** one channel's notes in one pattern, on a 16th grid. Left-drag draws (cells next to a note join it), right-drag erases, ▲/▼ change octave, click a key to hear it.
+- **Sampler (F8):** chop any audio onto 16 pads. Load a WAV, FLAC, MP3, OGG or AIFF file (or drop it on the window): it becomes a chop channel, chopped at its hits. Re-chop at the hits (with a sensitivity slider), into 8 or 16 equal slices, or by tapping Enter while it plays. Drag chop points on the waveform, double-click to add one, right-click to remove one. Each pad has pitch (which changes speed, like a turntable), reverse and level; One-shot plays whole slices, Cut itself stops the previous chop. Chops are notes, so you sequence them in the Piano Roll (one row per pad) and Playlist like any instrument.
 - **Mixer (F9):** a strip per mixer track plus Master, with faders and peak meters, and the lo-fi master insert (Tone, Crush, Wobble, Vinyl, Reverb).
 
 Knobs: drag up/down, scroll, or use the arrow keys; double-click resets.
@@ -22,12 +23,14 @@ Knobs: drag up/down, scroll, or use the arrow keys; double-click resets.
 - **File** menu: New (empty or the demo song), Open, Save, Save as. Projects are `.ritmo` files (readable JSON). `ritmo song.ritmo` opens a file from the terminal.
 - The title bar shows `•` when there are unsaved changes; New, Open and closing the window ask before discarding them.
 - Ritmo autosaves every minute to `~/.local/share/ritmo/autosave.ritmo` (or `$XDG_DATA_HOME/ritmo/`). Open that file if Ritmo ever closes unexpectedly.
+- Chop samples are referenced by their path, not copied into the project: keep the audio files where they are (copying them into the project folder is planned).
 - Open and Save use your desktop's file dialog through xdg-desktop-portal (install `xdg-desktop-portal-gtk`, `-gnome` or `-kde`), or `zenity` if no portal is running.
 
 ## Keys
 
 - `Z S X D C V G B H N J M` = C3 octave, `Q 2 W 3 E R 5 T 6 Y 7 U I 9 O 0 P` = C4 octave, played on the selected channel (outlined in the Channel Rack; the status bar names it).
-- **Space** = play/stop. **F5 / F6 / F7 / F9** = Playlist / Channel Rack / Piano Roll / Mixer.
+- On a chop channel the same keys play pads 1–16: `Z S X D C V G B H N J M Q 2 W 3`. While tap-chopping, **Enter** taps and **Esc** finishes.
+- **Space** = play/stop. **F5 / F6 / F7 / F8 / F9** = Playlist / Channel Rack / Piano Roll / Sampler / Mixer.
 - **Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S** = new / open / save / save as.
 - **Export** writes `~/Music/<project name>.wav` (or `ritmo-export.wav` before the first save): the song twice plus a 2 s tail.
 

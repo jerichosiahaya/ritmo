@@ -8,10 +8,13 @@
 //!
 //! IDs come from one counter per project and are never reused, even after a delete.
 
-use crate::engine::{ChannelMix, FX_NEUTRAL, Fx, MAX_CHANNELS, MAX_MIXER, MixerMix, SeqNote, Snapshot, pan_gains};
+use crate::engine::{ChannelMix, ChopMix, FX_NEUTRAL, Fx, MAX_CHANNELS, MAX_MIXER, MixerMix, SampleData, SeqNote, SliceMix, Snapshot, pan_gains};
+pub use crate::engine::{CHOP_BASE, MAX_SLICES};
 pub use crate::engine::{Instrument, PPQ, STEP, Tick};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Longest song the playlist allows.
 pub const MAX_BARS: Tick = 999;
@@ -72,6 +75,35 @@ pub struct Channel {
     pub pan: f32,
     pub mute: bool,
     pub mixer: MixerId,
+    /// The sample and slices of an `Instrument::Chop` channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chop: Option<Chop>,
+}
+
+/// A chop channel's audio and how it is cut into slices (one per pad).
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Chop {
+    /// The audio file, as chosen. If it is missing, the pads stay silent.
+    pub path: PathBuf,
+    /// The sample's length in frames when it was chopped.
+    pub len: u32,
+    /// End to end, in order; slice `k` plays on pad `k + 1` (pitch `CHOP_BASE + k`).
+    pub slices: Vec<Slice>,
+    /// Play each slice to its end whatever the note length.
+    pub one_shot: bool,
+    /// A new hit fades out the chops still sounding on this channel.
+    pub cut_itself: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Slice {
+    /// Frames of the sample, `start..end`.
+    pub start: u32,
+    pub end: u32,
+    /// Semitones; also changes speed, like a turntable.
+    pub pitch: f32,
+    pub reverse: bool,
+    pub gain: f32,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -203,7 +235,7 @@ impl Project {
             return None;
         }
         let id = ChannelId(self.fresh_id());
-        self.channels.push(Channel { id, name: name.into(), instrument, vol: 0.8, pan: 0.0, mute: false, mixer });
+        self.channels.push(Channel { id, name: name.into(), instrument, vol: 0.8, pan: 0.0, mute: false, mixer, chop: None });
         Some(id)
     }
 
@@ -306,7 +338,15 @@ impl Project {
     /// clip's notes placed in song time, sorted by start. Notes starting outside a clip's part of
     /// the pattern are skipped; notes running past the clip's end are cut there. Without a loop
     /// range, playback loops the song rounded up to whole bars.
+    #[cfg(test)]
     pub fn compile(&self) -> Snapshot {
+        self.compile_with(&|_| None)
+    }
+
+    /// `compile`, with chop channels' audio from `samples` (decoded audio by file path); `compile`
+    /// (tests only) leaves them without audio.
+    pub fn compile_with(&self, samples: &dyn Fn(&Path) -> Option<Arc<SampleData>>) -> Snapshot {
+        let mut chops = Vec::new();
         let gains = |vol: f32, pan: f32| {
             let (l, r) = pan_gains(pan);
             [vol * l, vol * r]
@@ -320,6 +360,11 @@ impl Project {
                 gain: gains(c.vol, c.pan),
                 mute: c.mute,
                 mixer: self.mixer.iter().take(MAX_MIXER).position(|m| m.id == c.mixer).unwrap_or(0),
+                chop: c.chop.as_ref().map(|chop| {
+                    let slices = chop.slices.iter().map(|s| SliceMix { start: s.start, end: s.end, speed: 2f32.powf(s.pitch / 12.0), reverse: s.reverse, gain: s.gain }).collect();
+                    chops.push(ChopMix { sample: samples(&chop.path), slices, one_shot: chop.one_shot, cut_itself: chop.cut_itself });
+                    chops.len() - 1
+                }),
             })
             .collect();
         let mixer = self.mixer.iter().take(MAX_MIXER).map(|m| MixerMix { gain: gains(m.vol, m.pan), mute: m.mute }).collect();
@@ -341,7 +386,7 @@ impl Project {
 
         let bar = self.bar_len();
         let (loop_start, loop_end) = self.loop_range.unwrap_or((0, self.end().div_ceil(bar).max(1) * bar));
-        Snapshot { bpm: self.bpm, swing: self.swing, fx: self.master, channels, mixer, notes, loop_start, loop_end }
+        Snapshot { bpm: self.bpm, swing: self.swing, fx: self.master, channels, mixer, notes, chops, loop_start, loop_end }
     }
 
     /// Checks every invariant: unique IDs no higher than the counter, references that resolve,
@@ -379,6 +424,15 @@ impl Project {
         for c in &self.channels {
             if self.mixer_track(c.mixer).is_none() {
                 return Err(format!("channel {:?} routes to missing mixer track {:?}", c.name, c.mixer));
+            }
+            if c.chop.is_some() != (c.instrument == Instrument::Chop) {
+                return Err(format!("channel {:?}: only chop channels have chop settings, and every chop channel has them", c.name));
+            }
+            if let Some(chop) = &c.chop {
+                let ok = |s: &Slice| s.start < s.end && s.end <= chop.len && (-48.0..=48.0).contains(&s.pitch) && (0.0..=4.0).contains(&s.gain);
+                if chop.slices.is_empty() || chop.slices.len() > MAX_SLICES || !chop.slices.iter().all(ok) || chop.slices.windows(2).any(|w| w[0].end != w[1].start) {
+                    return Err(format!("channel {:?} has invalid chops", c.name));
+                }
             }
         }
         for p in &self.patterns {
@@ -606,6 +660,107 @@ impl Project {
     }
 }
 
+/// Chop sampler operations. A chop channel's slices sit end to end, so "chop points" (the slice
+/// starts) describe them; per-slice settings stay with the slice's position.
+impl Project {
+    /// The chop settings of a chop channel.
+    pub fn chop(&self, channel: ChannelId) -> Option<&Chop> {
+        self.channel(channel).and_then(|c| c.chop.as_ref())
+    }
+
+    fn chop_mut(&mut self, channel: ChannelId) -> Option<&mut Chop> {
+        self.channels.iter_mut().find(|c| c.id == channel).and_then(|c| c.chop.as_mut())
+    }
+
+    /// Adds a chop channel for the audio at `path` (`len` frames), as one slice covering it all.
+    /// It routes to a "Chops" mixer track, added if there is room.
+    pub fn add_chop_channel(&mut self, name: &str, path: PathBuf, len: u32) -> Option<ChannelId> {
+        let mixer = match self.mixer.iter().find(|m| m.name == "Chops") {
+            Some(m) => m.id,
+            None => self.add_mixer_track("Chops").or(self.mixer.first().map(|m| m.id))?,
+        };
+        let id = self.add_channel(name, Instrument::Chop, mixer)?;
+        let chop = Chop { path, len, slices: Vec::new(), one_shot: true, cut_itself: true };
+        self.channels.last_mut()?.chop = Some(chop);
+        self.set_chop_points(id, &[0]);
+        Some(id)
+    }
+
+    /// Where each slice starts.
+    pub fn chop_points(&self, channel: ChannelId) -> Vec<u32> {
+        self.chop(channel).map_or(Vec::new(), |c| c.slices.iter().map(|s| s.start).collect())
+    }
+
+    /// Re-chops at `points` (sorted, deduplicated, inside the sample, at most `MAX_SLICES`).
+    /// Slice `k` keeps the pitch, reverse and level slice `k` had.
+    pub fn set_chop_points(&mut self, channel: ChannelId, points: &[u32]) {
+        let Some(c) = self.chop_mut(channel) else { return };
+        let mut pts: Vec<u32> = points.iter().copied().filter(|&p| p < c.len).collect();
+        pts.sort_unstable();
+        pts.dedup();
+        pts.truncate(MAX_SLICES);
+        let old = std::mem::take(&mut c.slices);
+        for (k, &start) in pts.iter().enumerate() {
+            let end = pts.get(k + 1).copied().unwrap_or(c.len);
+            let keep = old.get(k).copied().unwrap_or(Slice { start, end, pitch: 0.0, reverse: false, gain: 1.0 });
+            c.slices.push(Slice { start, end, ..keep });
+        }
+    }
+
+    /// Adds a chop point at `at`, splitting the slice there. False if there are already
+    /// `MAX_SLICES` slices or a point is already there.
+    pub fn add_chop_point(&mut self, channel: ChannelId, at: u32) -> bool {
+        let mut pts = self.chop_points(channel);
+        if pts.len() >= MAX_SLICES || pts.contains(&at) || self.chop(channel).is_none_or(|c| at >= c.len) {
+            return false;
+        }
+        // Keep the settings of later slices with them: insert an empty slot at the new index.
+        let k = pts.partition_point(|&p| p < at);
+        pts.insert(k, at);
+        if let Some(c) = self.chop_mut(channel) {
+            let fresh = Slice { start: at, end: at, pitch: 0.0, reverse: false, gain: 1.0 };
+            c.slices.insert(k, fresh);
+        }
+        self.set_chop_points(channel, &pts);
+        true
+    }
+
+    /// Removes chop point `k`, joining its slice to the one before (the first point moves the
+    /// start of the sample instead of disappearing when it is the only one).
+    pub fn remove_chop_point(&mut self, channel: ChannelId, k: usize) {
+        let mut pts = self.chop_points(channel);
+        if k >= pts.len() || pts.len() == 1 {
+            return;
+        }
+        pts.remove(k);
+        if let Some(c) = self.chop_mut(channel) {
+            c.slices.remove(k);
+        }
+        self.set_chop_points(channel, &pts);
+    }
+
+    /// Drags chop point `k` to `to`, kept between its neighbours.
+    pub fn move_chop_point(&mut self, channel: ChannelId, k: usize, to: u32) {
+        let pts = self.chop_points(channel);
+        let Some(c) = self.chop_mut(channel) else { return };
+        if k >= pts.len() {
+            return;
+        }
+        let lo = if k == 0 { 0 } else { pts[k - 1] + 1 };
+        let hi = pts.get(k + 1).map_or(c.len, |&p| p).saturating_sub(1);
+        let to = to.clamp(lo, hi.max(lo));
+        c.slices[k].start = to;
+        if k > 0 {
+            c.slices[k - 1].end = to;
+        }
+    }
+
+    /// Slice `k` of a chop channel, to change its pitch, reverse or level.
+    pub fn slice_mut(&mut self, channel: ChannelId, k: usize) -> Option<&mut Slice> {
+        self.chop_mut(channel).and_then(|c| c.slices.get_mut(k))
+    }
+}
+
 /// Removes the items matching `f` and returns how many were removed.
 fn remove<T>(v: &mut Vec<T>, f: impl Fn(&T) -> bool) -> usize {
     let before = v.len();
@@ -681,6 +836,88 @@ mod tests {
         let s = p.compile();
         assert!(s.notes.is_empty());
         assert_eq!((s.loop_start, s.loop_end), (0, BAR));
+    }
+
+    #[test]
+    fn chop_channels_and_points() {
+        let mut p = Project::demo();
+        let ch = p.add_chop_channel("Break", PathBuf::from("/samples/break.wav"), 1000).unwrap();
+        p.validate().unwrap();
+        assert_eq!(p.chop_points(ch), [0]);
+        assert_eq!(p.mixer_track(p.channel(ch).unwrap().mixer).unwrap().name, "Chops");
+        let slices = |p: &Project| p.chop(ch).unwrap().slices.iter().map(|s| (s.start, s.end, s.pitch)).collect::<Vec<_>>();
+
+        // Points outside the sample and duplicates are dropped; slices sit end to end.
+        p.set_chop_points(ch, &[750, 0, 250, 250, 500, 5000]);
+        assert_eq!(slices(&p), [(0, 250, 0.0), (250, 500, 0.0), (500, 750, 0.0), (750, 1000, 0.0)]);
+        p.slice_mut(ch, 1).unwrap().pitch = 5.0;
+        // Adding a point keeps each slice's settings with it.
+        assert!(p.add_chop_point(ch, 100));
+        assert!(!p.add_chop_point(ch, 100) && !p.add_chop_point(ch, 1000));
+        assert_eq!(slices(&p), [(0, 100, 0.0), (100, 250, 0.0), (250, 500, 5.0), (500, 750, 0.0), (750, 1000, 0.0)]);
+        p.remove_chop_point(ch, 1);
+        assert_eq!(slices(&p), [(0, 250, 0.0), (250, 500, 5.0), (500, 750, 0.0), (750, 1000, 0.0)]);
+        // Dragging stays between the neighbours.
+        p.move_chop_point(ch, 2, 100);
+        p.move_chop_point(ch, 3, 2000);
+        assert_eq!(slices(&p), [(0, 250, 0.0), (250, 251, 5.0), (251, 999, 0.0), (999, 1000, 0.0)]);
+        p.validate().unwrap();
+
+        // At most MAX_SLICES pads; the last point can't be removed.
+        p.set_chop_points(ch, &(0..40).map(|k| k * 20).collect::<Vec<_>>());
+        assert_eq!(p.chop_points(ch).len(), MAX_SLICES);
+        assert!(!p.add_chop_point(ch, 999));
+        p.set_chop_points(ch, &[0]);
+        p.remove_chop_point(ch, 0);
+        assert_eq!(p.chop_points(ch), [0]);
+        p.validate().unwrap();
+        // Not a chop channel: nothing happens.
+        let kick = channel_named(&p, "Kick");
+        p.set_chop_points(kick, &[0, 10]);
+        assert!(p.chop(kick).is_none() && p.chop_points(kick).is_empty());
+    }
+
+    #[test]
+    fn chops_compile_with_their_sample() {
+        let mut p = Project::demo();
+        let ch = p.add_chop_channel("Break", PathBuf::from("/samples/break.wav"), 1000).unwrap();
+        p.set_chop_points(ch, &[0, 500]);
+        p.slice_mut(ch, 1).unwrap().pitch = 12.0;
+        p.slice_mut(ch, 1).unwrap().reverse = true;
+        let beat = named(&p, "Pattern 1").id;
+        p.add_note(beat, ch, CHOP_BASE + 1, 0, STEP, 100).unwrap();
+        let data = Arc::new(SampleData { sr: 44100, frames: vec![[0.0; 2]; 1000] });
+        let s = p.compile_with(&|path| (path == Path::new("/samples/break.wav")).then(|| data.clone()));
+        let i = p.channel_index(ch).unwrap();
+        assert_eq!(s.channels[i].chop, Some(0));
+        let c = &s.chops[0];
+        assert!(Arc::ptr_eq(c.sample.as_ref().unwrap(), &data));
+        assert_eq!((c.slices[1].start, c.slices[1].end, c.slices[1].reverse), (500, 1000, true));
+        assert!((c.slices[1].speed - 2.0).abs() < 1e-6);
+        assert!(s.notes.iter().any(|n| n.channel as usize == i && n.pitch == CHOP_BASE + 1));
+        // Without the audio the channel is still there, silent.
+        assert!(p.compile().chops[0].sample.is_none());
+        assert!(s.channels.iter().filter(|c| c.instrument != Instrument::Chop).all(|c| c.chop.is_none()));
+    }
+
+    #[test]
+    fn validate_checks_chops() {
+        let mut p = Project::demo();
+        let ch = p.add_chop_channel("Break", PathBuf::from("b.wav"), 1000).unwrap();
+        p.set_chop_points(ch, &[0, 500]);
+        p.validate().unwrap();
+        let i = p.channel_index(ch).unwrap();
+        let broken = |f: &dyn Fn(&mut Project)| {
+            let mut q = p.clone();
+            f(&mut q);
+            q.validate().unwrap_err()
+        };
+        broken(&|q| q.channels[i].chop.as_mut().unwrap().slices[0].end = 400); // gap
+        broken(&|q| q.channels[i].chop.as_mut().unwrap().slices[1].end = 2000); // past the end
+        broken(&|q| q.channels[i].chop.as_mut().unwrap().slices.clear());
+        broken(&|q| q.channels[i].chop.as_mut().unwrap().slices[0].pitch = 100.0);
+        broken(&|q| q.channels[i].chop = None);
+        broken(&|q| q.channels[0].chop = q.channels[i].chop.clone());
     }
 
     #[test]

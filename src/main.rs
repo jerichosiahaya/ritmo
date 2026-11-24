@@ -2,13 +2,15 @@ mod engine;
 mod file;
 mod project;
 mod rt;
+mod sample;
 mod widgets;
 mod windows;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{self, Color32, Key, RichText};
-use engine::{Cmd, Engine, Instrument, METERS, Snapshot, STEP};
-use project::{CHORDS, ChannelId, PatternId, Project, Tick, TrackId};
+use engine::{Cmd, Engine, Instrument, METERS, SampleData, Snapshot, STEP};
+use std::collections::HashMap;
+use project::{CHOP_BASE, CHORDS, ChannelId, MAX_SLICES, PatternId, Project, Tick, TrackId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -95,14 +97,29 @@ enum Win {
     Rack,
     Roll,
     Mixer,
+    Chop,
 }
 
-const WINDOWS: [(Win, &str, Key); 4] = [
+const WINDOWS: [(Win, &str, Key); 5] = [
     (Win::Playlist, "▤ Playlist", Key::F5),
     (Win::Rack, "▦ Rack", Key::F6),
     (Win::Roll, "♫ Roll", Key::F7),
+    (Win::Chop, "✂ Sampler", Key::F8),
     (Win::Mixer, "☰ Mixer", Key::F9),
 ];
+
+/// Audio files the sampler can load.
+const AUDIO_EXTENSIONS: &[&str] = &["wav", "flac", "mp3", "ogg", "aif", "aiff"];
+
+/// Tap-to-chop in progress.
+struct Tap {
+    channel: ChannelId,
+    index: u16,
+    started: Instant,
+    sr: u32,
+    len: u32,
+    points: Vec<u32>,
+}
 
 /// What to do once unsaved changes are dealt with.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -116,6 +133,7 @@ enum Then {
 /// A file dialog's answer, from its thread.
 enum Dialog {
     Open(Option<PathBuf>),
+    Sample(Option<PathBuf>),
     SaveAs(Option<PathBuf>, Then),
 }
 
@@ -147,7 +165,7 @@ struct App {
     audio: Option<Audio>,
     status: String,
     export_rx: Option<mpsc::Receiver<String>>,
-    open: [bool; 4],
+    open: [bool; 5],
     /// Smoothed meter levels for display.
     meters: [f32; METERS],
     /// Playlist selection; a chord clicked in the browser is stamped there.
@@ -166,6 +184,43 @@ struct App {
     preview: Option<u8>,
     /// Playing tick, if playing.
     cur: Option<Tick>,
+    /// Decoded chop samples by path (or why they could not be read).
+    samples: HashMap<PathBuf, Result<Loaded, String>>,
+    /// Bumped whenever a sample arrives, so the engine gets a new snapshot.
+    samples_rev: u64,
+    sent_rev: u64,
+    loader: (mpsc::Sender<LoadResult>, mpsc::Receiver<LoadResult>),
+    /// Samples being loaded to become new chop channels.
+    new_chops: Vec<PathBuf>,
+    /// The chop channel in the Sampler window, its selected pad, and a chop point being dragged.
+    chop_ch: Option<ChannelId>,
+    chop_sel: usize,
+    chop_drag: Option<usize>,
+    /// Auto-chop sensitivity, 0..1.
+    sensitivity: f32,
+    tap: Option<Tap>,
+    /// Commands to send once this frame's snapshot is on its way.
+    after_send: Vec<Cmd>,
+}
+
+/// A sample path and what loading it gave.
+type LoadResult = (PathBuf, Result<Loaded, String>);
+
+/// A decoded sample and its waveform overview for drawing.
+pub struct Loaded {
+    pub data: Arc<SampleData>,
+    pub overview: Vec<[f32; 2]>,
+}
+
+/// Points in a sample's waveform overview.
+pub const OVERVIEW: usize = 4096;
+
+impl Loaded {
+    fn decode(path: &Path) -> Result<Loaded, String> {
+        let data = sample::decode(path)?;
+        let overview = sample::overview(&data, 0, data.frames.len(), OVERVIEW);
+        Ok(Loaded { data: Arc::new(data), overview })
+    }
 }
 
 impl App {
@@ -187,7 +242,7 @@ impl App {
             audio,
             status,
             export_rx: None,
-            open: [true, true, false, false],
+            open: [true, true, false, false, false],
             meters: [0.0; METERS],
             sel_bar: 0,
             pattern: PatternId(0),
@@ -197,6 +252,17 @@ impl App {
             roll_paint: None,
             preview: None,
             cur: None,
+            samples: HashMap::new(),
+            samples_rev: 0,
+            sent_rev: 0,
+            loader: mpsc::channel(),
+            new_chops: Vec::new(),
+            chop_ch: None,
+            chop_sel: 0,
+            chop_drag: None,
+            sensitivity: 0.5,
+            tap: None,
+            after_send: Vec::new(),
         };
         app.set_project(project, path);
         app
@@ -212,6 +278,9 @@ impl App {
         let roll_pat = project.patterns.iter().find(|p| p.notes.iter().any(|n| n.channel == roll_ch)).map_or(pattern, |p| p.id);
         self.sel_track = project.tracks.first().map(|t| t.id);
         self.sel_bar = 0;
+        self.chop_ch = project.channels.iter().find(|c| c.chop.is_some()).map(|c| c.id);
+        (self.chop_sel, self.chop_drag) = (0, None);
+        self.tap = None;
         self.pattern = pattern;
         self.saved = project.clone();
         self.project = project;
@@ -219,6 +288,129 @@ impl App {
         let roll_open = self.is_open(Win::Roll);
         self.edit_in_roll(roll_pat, roll_ch);
         self.open[Win::Roll as usize] = roll_open;
+    }
+
+    /// The project as the engine plays it, with the decoded chop samples.
+    fn compile(&self) -> Snapshot {
+        self.project.compile_with(&|p| self.samples.get(p).and_then(|s| s.as_ref().ok()).map(|s| s.data.clone()))
+    }
+
+    /// Starts decoding chop samples the project uses and the cache lacks (on a background
+    /// thread), and takes in the ones that finished.
+    fn load_samples(&mut self) {
+        while let Ok((path, loaded)) = self.loader.1.try_recv() {
+            if let Err(e) = &loaded {
+                self.status = format!("Could not load {}: {e}", path.display());
+            }
+            let ok = loaded.is_ok();
+            self.samples.insert(path.clone(), loaded);
+            self.samples_rev += 1;
+            if let Some(i) = self.new_chops.iter().position(|p| *p == path) {
+                self.new_chops.remove(i);
+                if ok {
+                    self.new_chop_channel(&path);
+                }
+            }
+        }
+        let missing: Vec<PathBuf> = self.project.channels.iter().filter_map(|c| c.chop.as_ref()).map(|c| c.path.clone()).filter(|p| !self.samples.contains_key(p)).collect();
+        for path in missing {
+            self.start_loading(path);
+        }
+    }
+
+    /// The chop channel the Sampler window shows; makes the keyboard play its pads.
+    fn select_chop(&mut self, channel: ChannelId) {
+        self.chop_ch = Some(channel);
+        self.chop_sel = 0;
+        self.live = channel;
+        self.open[Win::Chop as usize] = true;
+    }
+
+    /// The decoded audio of a chop channel, if it has loaded.
+    pub fn chop_sample(&self, channel: ChannelId) -> Option<&Loaded> {
+        let path = &self.project.chop(channel)?.path;
+        self.samples.get(path)?.as_ref().ok()
+    }
+
+    fn load_sample_dialog(&mut self) {
+        let dir = self.dialog_dir();
+        self.file_dialog(move || {
+            let pick = rfd::FileDialog::new().set_title("Load a sample to chop").add_filter("Audio", AUDIO_EXTENSIONS).set_directory(dir).pick_file();
+            Dialog::Sample(pick)
+        });
+    }
+
+    /// Makes a new chop channel from the audio at `path`, chopped at its hits, once it decodes.
+    fn add_sample(&mut self, path: PathBuf) {
+        self.status = format!("Loading {}…", path.display());
+        match self.samples.get(&path) {
+            Some(Ok(_)) => self.new_chop_channel(&path),
+            // Loading already, or failed before: try again.
+            _ => {
+                self.samples.remove(&path);
+                self.new_chops.push(path.clone());
+                self.start_loading(path);
+            }
+        }
+    }
+
+    fn start_loading(&mut self, path: PathBuf) {
+        self.samples.insert(path.clone(), Err("loading…".into()));
+        let tx = self.loader.0.clone();
+        std::thread::spawn(move || {
+            let loaded = Loaded::decode(&path);
+            let _ = tx.send((path, loaded));
+        });
+    }
+
+    fn new_chop_channel(&mut self, path: &Path) {
+        let Some(Ok(loaded)) = self.samples.get(path) else { return };
+        let data = loaded.data.clone();
+        let name = path.file_stem().map_or("Chop".into(), |s| s.to_string_lossy().into_owned());
+        let len = data.frames.len().min(u32::MAX as usize) as u32;
+        let Some(ch) = self.project.add_chop_channel(&name, path.to_path_buf(), len) else {
+            self.status = "No room for another channel.".into();
+            return;
+        };
+        let points = sample::detect_hits(&data, self.sensitivity, MAX_SLICES);
+        self.project.set_chop_points(ch, &points);
+        self.status = format!("Chopped {name} into {} pads at its hits — play them with Z S X D C V…", points.len());
+        self.select_chop(ch);
+    }
+
+    /// Tap to chop: plays the whole sample; each tap (Enter or the Tap button) starts a new pad.
+    fn start_tap(&mut self, channel: ChannelId) {
+        let Some(sr) = self.chop_sample(channel).map(|l| l.data.sr) else { return };
+        self.project.set_chop_points(channel, &[0]);
+        if let Some(s) = self.project.slice_mut(channel, 0) {
+            (s.pitch, s.reverse) = (0.0, false);
+        }
+        let len = self.project.chop(channel).map_or(0, |c| c.len);
+        let index = self.project.channel_index(channel).map_or(u16::MAX, |i| i as u16);
+        // After the snapshot with the single whole-sample slice reaches the engine.
+        self.after_send.push(Cmd::NoteOn { channel: index, pitch: CHOP_BASE });
+        self.tap = Some(Tap { channel, index, started: Instant::now(), sr, len, points: Vec::new() });
+        self.status = "Tap Enter (or the Tap button) where each chop starts…".into();
+    }
+
+    fn tap(&mut self) {
+        if let Some(t) = &mut self.tap {
+            let at = (t.started.elapsed().as_secs_f64() * t.sr as f64) as u32;
+            if at < t.len && t.points.len() < MAX_SLICES {
+                t.points.push(at);
+            }
+        }
+    }
+
+    /// Ends tapping (also when the sample has played through) and chops at the taps.
+    fn finish_tap(&mut self) {
+        let Some(t) = self.tap.take() else { return };
+        self.send(Cmd::NoteOff { channel: t.index, pitch: CHOP_BASE });
+        // The sound before the first tap stays as pad 1; each tap starts the next pad.
+        let points: Vec<u32> = std::iter::once(0).chain(t.points).collect();
+        self.project.set_chop_points(t.channel, &points);
+        let pads = self.project.chop_points(t.channel).len();
+        self.status = format!("{pads} pads from your taps");
     }
 
     fn dirty(&self) -> bool {
@@ -325,13 +517,14 @@ impl App {
     fn dialog_done(&mut self, ctx: &egui::Context, d: Dialog) {
         match d {
             Dialog::Open(Some(path)) => self.open_file(path),
+            Dialog::Sample(Some(path)) => self.add_sample(path),
             Dialog::SaveAs(Some(path), then) => {
                 if self.write(&path) {
                     self.run(ctx, then);
                 }
             }
             // Also what comes back when the desktop has no file chooser at all.
-            Dialog::Open(None) | Dialog::SaveAs(None, _) => {
+            Dialog::Open(None) | Dialog::Sample(None) | Dialog::SaveAs(None, _) => {
                 self.status = "No file chosen. (No dialog appeared? Install xdg-desktop-portal-gtk, -gnome or -kde, or zenity.)".into();
             }
         }
@@ -453,8 +646,14 @@ impl App {
         self.roll = (pattern, channel);
         self.live = channel;
         let lowest = self.project.pattern(pattern).and_then(|p| p.notes.iter().filter(|n| n.channel == channel).map(|n| n.pitch).min());
-        let default = if self.project.channel(channel).is_some_and(|c| c.instrument == Instrument::Bass) { 36 } else { 60 };
-        let low = lowest.map_or(default, |n| n - n % 12);
+        let inst = self.project.channel(channel).map(|c| c.instrument);
+        let default = match inst {
+            Some(Instrument::Bass) => 36,
+            Some(Instrument::Chop) => CHOP_BASE,
+            _ => 60,
+        };
+        // Chop channels show pads 1-16 from the bottom row.
+        let low = if inst == Some(Instrument::Chop) { CHOP_BASE } else { lowest.map_or(default, |n| n - n % 12) };
         self.roll_low = low.min(127 - windows::ROLL_KEYS as u8 + 1);
         self.open[Win::Roll as usize] = true;
     }
@@ -479,7 +678,7 @@ impl App {
     }
 
     fn export(&mut self) {
-        let snap = self.project.compile();
+        let snap = self.compile();
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let dir = Path::new(&home).join("Music");
         let dir = if dir.is_dir() { dir } else { PathBuf::from(".") };
@@ -507,7 +706,9 @@ impl App {
             if modifiers.command || modifiers.ctrl || modifiers.alt {
                 continue;
             }
-            if let Some(&(w, _, _)) = WINDOWS.iter().find(|(_, _, k)| *k == key) {
+            if self.tap.is_some() && pressed && (key == Key::Enter || key == Key::Escape) {
+                if key == Key::Enter { self.tap() } else { self.finish_tap() }
+            } else if let Some(&(w, _, _)) = WINDOWS.iter().find(|(_, _, k)| *k == key) {
                 if pressed {
                     self.open[w as usize] ^= true;
                 }
@@ -563,11 +764,17 @@ impl App {
                     let c = &self.project.channels[i];
                     let (id, inst) = (c.id, c.instrument);
                     let text = RichText::new(format!("■ {}", c.name)).color(channel_color(i));
-                    let hint = if inst.is_drum() { "Synth drum · click to play it from the keyboard" } else { "Click to edit in the piano roll" };
+                    let hint = match inst {
+                        _ if inst.is_drum() => "Synth drum · click to play it from the keyboard",
+                        Instrument::Chop => "Chop sampler · click to open it in the Sampler",
+                        _ => "Click to edit in the piano roll",
+                    };
                     if ui.selectable_label(self.live == id, text).on_hover_text(hint).clicked() {
                         if inst.is_drum() {
                             self.live = id;
                             self.open[Win::Rack as usize] = true;
+                        } else if inst == Instrument::Chop {
+                            self.select_chop(id);
                         } else {
                             self.edit_channel(id);
                         }
@@ -645,6 +852,16 @@ impl eframe::App for App {
         }
         self.file_shortcuts(&ctx);
         self.handle_keys(&ctx);
+        // Audio files dropped on the window become chop channels.
+        for f in ctx.input(|i| i.raw.dropped_files.clone()) {
+            let path = f.path();
+            if path.extension().is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str())) {
+                self.add_sample(path.to_path_buf());
+            }
+        }
+        if self.tap.as_ref().is_some_and(|t| t.started.elapsed().as_secs_f64() * t.sr as f64 >= t.len as f64) {
+            self.finish_tap();
+        }
         if let Some(msg) = self.export_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.status = msg;
             self.export_rx = None;
@@ -668,7 +885,7 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     let live = self.project.channel(self.live).map_or("—", |c| c.name.as_str());
-                    ui.label(RichText::new(format!("Keys play {live}: Z–M = C3 · Q–P = C4 · Space play/stop · F5 Playlist · F6 Rack · F7 Piano Roll · F9 Mixer")).small().weak());
+                    ui.label(RichText::new(format!("Keys play {live}: Z–M = C3 · Q–P = C4 · Space play/stop · F5 Playlist · F6 Rack · F7 Piano Roll · F8 Sampler · F9 Mixer")).small().weak());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(&self.status).small());
                         // Debug builds only: the real-time guard saw the audio thread use the heap.
@@ -704,20 +921,25 @@ impl eframe::App for App {
 
         // Send the project whenever it changed. If the queue was full, `sent` stays stale and it
         // goes out on the next frame.
-        if self.sent.as_ref() != Some(&self.project) {
+        self.load_samples();
+        if self.sent.as_ref() != Some(&self.project) || self.sent_rev != self.samples_rev {
             // Debug builds check that every edit keeps the project valid.
             if let Err(e) = self.project.validate() {
                 debug_assert!(false, "edit broke the project: {e}");
             }
-            let snap = self.project.compile();
+            let snap = self.compile();
             if self.send(Cmd::Snapshot(Box::new(snap.clone()))) || self.audio.is_none() {
                 self.snap = snap;
                 self.sent = Some(self.project.clone());
+                self.sent_rev = self.samples_rev;
             }
+        }
+        for cmd in std::mem::take(&mut self.after_send) {
+            self.send(cmd);
         }
         if self.playing || self.export_rx.is_some() || self.meters.iter().any(|&m| m > 1e-3) {
             ctx.request_repaint_after(Duration::from_millis(16));
-        } else if self.dialog_rx.is_some() {
+        } else if self.dialog_rx.is_some() || self.tap.is_some() || !self.new_chops.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else {
             ctx.request_repaint_after(AUTOSAVE_EVERY);
