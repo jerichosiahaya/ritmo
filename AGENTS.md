@@ -19,10 +19,11 @@ Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian
 - `src/project.rs`: the v0.2 project model (channels, mixer tracks, patterns with notes, playlist tracks and clips, all with stable IDs; time in ticks, `PPQ` = 96). `compile()` builds the engine's `Snapshot`; `validate()` checks every invariant (debug builds run it after every edit). Editing operations the windows use (`toggle_step`, `set_cell`, `stamp_chord`, `toggle_bar`, …) live here with tests, not in the UI. `Project::demo()` is the startup song. Keep `validate()` and its tests in step with any new field.
 - `src/file.rs`: `.ritmo` project files: JSON with a `format` and `version`, written to a temp file and renamed into place, upgraded by `migrate` and checked with `validate()` on open; autosave goes to `$XDG_DATA_HOME/ritmo/autosave.ritmo`. `tests/files/` holds a fixture per format version.
 - `src/sample.rs`: audio files for the chop sampler: `decode` (symphonia: WAV, FLAC, MP3, OGG, AIFF), `detect_hits` (level-jump onset detection), `even_points`, and `overview` for waveform drawing. Never called on the audio thread; the app decodes on a background thread and caches samples by path.
+- `src/history.rs`: undo/redo as whole-project states (`History<Project>`). The app calls `observe` every frame; a change becomes one step once it settles (no button held, no scroll running, no text field focused). Any edit to `app.project` is undoable automatically; after undo/redo or a delete, `App::fix_selection` repairs selections that point at removed items.
 - `src/rt.rs`: the real-time guard. In debug and test builds it counts heap use inside `rt::enter()`/`rt::exit()` (the audio callback); the status bar shows a warning if it ever happens.
 - `src/main.rs`: app state (`App`), the cpal audio stream, toolbar and File menu (new/open/save, the "Save changes?" prompt, autosave, system file dialogs via `rfd` on a background thread), browser panel, keyboard shortcuts.
 - `src/windows.rs`: the floating windows (Playlist, Channel Rack, Piano Roll, Sampler, Mixer).
-- `src/widgets.rs`: theme colors and custom widgets (knob, LED, step button, meter, LCD).
+- `src/widgets.rs`: theme colors and custom widgets (knob, LED, step button, meter, LCD) and `edit_menu`, a right-click menu that stays open for text fields (rename).
 
 ## How data flows
 

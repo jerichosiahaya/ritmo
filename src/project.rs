@@ -282,7 +282,7 @@ impl Project {
         Some(id)
     }
 
-    #[allow(dead_code)] // The UI's delete commands arrive with undo (roadmap week 4).
+    #[allow(dead_code)] // Note-level editing arrives with the piano-roll upgrade (week 8).
     pub fn remove_note(&mut self, pattern: PatternId, note: NoteId) -> bool {
         self.pattern_mut(pattern).is_some_and(|p| remove(&mut p.notes, |n| n.id == note) > 0)
     }
@@ -292,21 +292,18 @@ impl Project {
     }
 
     /// Also removes every clip of the pattern.
-    #[allow(dead_code)] // The UI's delete commands arrive with undo (roadmap week 4).
     pub fn remove_pattern(&mut self, id: PatternId) -> bool {
         remove(&mut self.clips, |c| c.pattern == id);
         remove(&mut self.patterns, |p| p.id == id) > 0
     }
 
     /// Also removes every clip on the track.
-    #[allow(dead_code)] // The UI's delete commands arrive with undo (roadmap week 4).
     pub fn remove_track(&mut self, id: TrackId) -> bool {
         remove(&mut self.clips, |c| c.track == id);
         remove(&mut self.tracks, |t| t.id == id) > 0
     }
 
     /// Also removes the channel's notes from every pattern.
-    #[allow(dead_code)] // The UI's delete commands arrive with undo (roadmap week 4).
     pub fn remove_channel(&mut self, id: ChannelId) -> bool {
         for p in &mut self.patterns {
             remove(&mut p.notes, |n| n.channel == id);
@@ -660,6 +657,39 @@ impl Project {
     }
 }
 
+/// Managing patterns and tracks.
+impl Project {
+    /// The first of `names` not in `taken`.
+    fn free_name<'a>(mut names: impl Iterator<Item = String>, taken: impl Iterator<Item = &'a str> + Clone) -> String {
+        names.find(|name| !taken.clone().any(|t| t == name)).expect("names never run out")
+    }
+
+    /// A new empty one-bar pattern, named "Pattern N" with the lowest free N.
+    pub fn new_pattern(&mut self) -> PatternId {
+        let name = Self::free_name((1..).map(|n| format!("Pattern {n}")), self.patterns.iter().map(|p| p.name.as_str()));
+        self.add_pattern(&name, self.bar_len())
+    }
+
+    /// A copy of a pattern (its notes get new IDs), named "<name> copy".
+    pub fn clone_pattern(&mut self, id: PatternId) -> Option<PatternId> {
+        let p = self.pattern(id)?.clone();
+        let base = format!("{} copy", p.name);
+        let names = std::iter::once(base.clone()).chain((2..).map(|n| format!("{base} {n}")));
+        let name = Self::free_name(names, self.patterns.iter().map(|p| p.name.as_str()));
+        let copy = self.add_pattern(&name, p.len);
+        for n in &p.notes {
+            self.add_note(copy, n.channel, n.pitch, n.start, n.len, n.vel);
+        }
+        Some(copy)
+    }
+
+    /// A new empty playlist track, named "Track N".
+    pub fn new_track(&mut self) -> TrackId {
+        let name = Self::free_name((1..).map(|n| format!("Track {n}")), self.tracks.iter().map(|t| t.name.as_str()));
+        self.add_track(&name)
+    }
+}
+
 /// Chop sampler operations. A chop channel's slices sit end to end, so "chop points" (the slice
 /// starts) describe them; per-slice settings stay with the slice's position.
 impl Project {
@@ -918,6 +948,41 @@ mod tests {
         broken(&|q| q.channels[i].chop.as_mut().unwrap().slices[0].pitch = 100.0);
         broken(&|q| q.channels[i].chop = None);
         broken(&|q| q.channels[0].chop = q.channels[i].chop.clone());
+    }
+
+    #[test]
+    fn patterns_new_clone_delete() {
+        let mut p = Project::demo();
+        let a = p.new_pattern();
+        let b = p.new_pattern();
+        let names: Vec<&str> = p.patterns.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["Pattern 1", "Chords", "Melody", "Pattern 2", "Pattern 3"]);
+        assert!(p.pattern(a).unwrap().notes.is_empty() && p.pattern(b).unwrap().len == BAR);
+
+        let melody = named(&p, "Melody").id;
+        let copy = p.clone_pattern(melody).unwrap();
+        let (orig, dup) = (p.pattern(melody).unwrap(), p.pattern(copy).unwrap());
+        assert_eq!(dup.name, "Melody copy");
+        assert_eq!((dup.len, dup.notes.len()), (orig.len, orig.notes.len()));
+        let same = |x: &Note, y: &Note| (x.channel, x.pitch, x.start, x.len, x.vel) == (y.channel, y.pitch, y.start, y.len, y.vel);
+        assert!(orig.notes.iter().zip(&dup.notes).all(|(x, y)| same(x, y) && x.id != y.id));
+        let copy2 = p.clone_pattern(melody).unwrap();
+        assert_eq!(p.pattern(copy2).unwrap().name, "Melody copy 2");
+        assert!(p.clone_pattern(PatternId(9999)).is_none());
+        p.validate().unwrap();
+
+        // Deleting a pattern takes its clips off the playlist.
+        assert!(p.remove_pattern(melody));
+        assert!(p.clips.iter().all(|c| c.pattern != melody));
+        p.validate().unwrap();
+
+        let t = p.new_track();
+        assert_eq!(p.track(t).unwrap().name, "Track 1");
+        let t2 = p.new_track();
+        assert_eq!(p.track(t2).unwrap().name, "Track 2");
+        let mut q = Project::default();
+        let first = q.new_pattern();
+        assert_eq!(q.pattern(first).unwrap().name, "Pattern 1");
     }
 
     #[test]

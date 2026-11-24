@@ -1,5 +1,6 @@
 mod engine;
 mod file;
+mod history;
 mod project;
 mod rt;
 mod sample;
@@ -10,6 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{self, Color32, Key, RichText};
 use engine::{Cmd, Engine, Instrument, METERS, SampleData, Snapshot, STEP};
 use std::collections::HashMap;
+use history::History;
 use project::{CHOP_BASE, CHORDS, ChannelId, MAX_SLICES, PatternId, Project, Tick, TrackId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -146,6 +148,7 @@ struct App {
     path: Option<PathBuf>,
     /// The project as last saved or opened; anything else is unsaved.
     saved: Project,
+    history: History<Project>,
     /// The project as last autosaved.
     autosaved: Option<Project>,
     last_autosave: Instant,
@@ -228,6 +231,7 @@ impl App {
         let mut app = App {
             sel_track: None,
             saved: Project::default(),
+            history: History::new(&Project::default()),
             project: Project::default(),
             path: None,
             autosaved: None,
@@ -283,6 +287,7 @@ impl App {
         self.tap = None;
         self.pattern = pattern;
         self.saved = project.clone();
+        self.history.reset(&project);
         self.project = project;
         self.path = path;
         let roll_open = self.is_open(Win::Roll);
@@ -411,6 +416,51 @@ impl App {
         self.project.set_chop_points(t.channel, &points);
         let pads = self.project.chop_points(t.channel).len();
         self.status = format!("{pads} pads from your taps");
+    }
+
+    fn undo(&mut self) {
+        if self.history.undo(&mut self.project) {
+            self.fix_selection();
+            self.status = "Undo".into();
+        }
+    }
+
+    fn redo(&mut self) {
+        if self.history.redo(&mut self.project) {
+            self.fix_selection();
+            self.status = "Redo".into();
+        }
+    }
+
+    /// After an undo or a delete: anything selected that no longer exists falls back to
+    /// something that does.
+    fn fix_selection(&mut self) {
+        let p = &self.project;
+        let first_pattern = p.patterns.first().map_or(PatternId(0), |x| x.id);
+        let first_channel = p.channels.first().map_or(ChannelId(0), |c| c.id);
+        if p.pattern(self.pattern).is_none() {
+            self.pattern = first_pattern;
+        }
+        if p.pattern(self.roll.0).is_none() {
+            self.roll.0 = first_pattern;
+        }
+        if p.channel(self.roll.1).is_none() {
+            self.roll.1 = p.channels.iter().find(|c| !c.instrument.is_drum()).map_or(first_channel, |c| c.id);
+        }
+        if p.channel(self.live).is_none() {
+            self.live = self.roll.1;
+        }
+        if self.chop_ch.is_some_and(|c| p.chop(c).is_none()) {
+            self.chop_ch = p.channels.iter().find(|c| c.chop.is_some()).map(|c| c.id);
+        }
+        let pads = self.chop_ch.and_then(|c| p.chop(c)).map_or(1, |c| c.slices.len());
+        self.chop_sel = self.chop_sel.min(pads.saturating_sub(1));
+        if self.sel_track.is_some_and(|t| p.track(t).is_none()) {
+            self.sel_track = p.tracks.first().map(|t| t.id);
+        }
+        if self.tap.as_ref().is_some_and(|t| p.chop(t.channel).is_none()) {
+            self.tap = None;
+        }
     }
 
     fn dirty(&self) -> bool {
@@ -546,7 +596,15 @@ impl App {
     fn file_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{KeyboardShortcut as K, Modifiers as M};
         let hit = |m, k| ctx.input_mut(|i| i.consume_shortcut(&K::new(m, k)));
-        // Shift first: Ctrl+S also matches Ctrl+Shift+S.
+        // Undo and redo, unless a text field is being edited (it has its own undo).
+        // Shift first: Ctrl+Z also matches Ctrl+Shift+Z (and Ctrl+S matches Ctrl+Shift+S).
+        if !ctx.egui_wants_keyboard_input() {
+            if hit(M::COMMAND | M::SHIFT, Key::Z) || hit(M::COMMAND, Key::Y) {
+                self.redo();
+            } else if hit(M::COMMAND, Key::Z) {
+                self.undo();
+            }
+        }
         if hit(M::COMMAND | M::SHIFT, Key::S) {
             self.save_as(Then::Nothing);
         } else if hit(M::COMMAND, Key::S) {
@@ -725,6 +783,12 @@ impl App {
         ui.horizontal_centered(|ui| {
             ui.label(RichText::new("◆ RITMO").strong().size(18.0).color(ACCENT));
             self.file_menu(ui);
+            if ui.add_enabled(self.history.can_undo(&self.project), egui::Button::new("↶")).on_hover_text("Undo (Ctrl+Z)").clicked() {
+                self.undo();
+            }
+            if ui.add_enabled(self.history.can_redo(), egui::Button::new("↷")).on_hover_text("Redo (Ctrl+Shift+Z or Ctrl+Y)").clicked() {
+                self.redo();
+            }
             ui.separator();
             if ui.add(egui::Button::selectable(self.playing, RichText::new("▶").size(16.0))).on_hover_text("Play (Space)").clicked() {
                 self.set_playing(true);
@@ -796,19 +860,45 @@ impl App {
                 }
             });
             egui::CollapsingHeader::new("▦ Patterns").default_open(true).show(ui, |ui| {
-                for (i, p) in self.project.patterns.iter().enumerate() {
+                if ui.small_button("＋ New pattern").on_hover_text("Add an empty one-bar pattern").clicked() {
+                    self.pattern = self.project.new_pattern();
+                    self.open[Win::Rack as usize] = true;
+                }
+                let (mut clone, mut delete) = (None, None);
+                let only_one = self.project.patterns.len() <= 1;
+                for i in 0..self.project.patterns.len() {
+                    let p = &self.project.patterns[i];
                     let resp = ui
                         .selectable_label(self.pattern == p.id, RichText::new(&p.name).color(pattern_color(i)))
-                        .on_hover_text("Click: edit its steps in the Channel Rack · double-click: piano roll");
+                        .on_hover_text("Click: edit its steps in the Channel Rack · double-click: piano roll · right-click: rename, clone, delete");
                     if resp.double_clicked() {
                         let ch = p.notes.iter().map(|n| n.channel).find(|&c| self.project.channel(c).is_some_and(|c| !c.instrument.is_drum()));
                         let (pid, ch) = (p.id, ch.unwrap_or(self.roll.1));
                         self.edit_in_roll(pid, ch);
-                        break;
                     } else if resp.clicked() {
                         self.pattern = p.id;
                         self.open[Win::Rack as usize] = true;
                     }
+                    let id = self.project.patterns[i].id;
+                    edit_menu(&resp, |ui| {
+                        ui.label(RichText::new("Name").small().weak());
+                        ui.text_edit_singleline(&mut self.project.patterns[i].name);
+                        if ui.button("⧉ Clone").clicked() {
+                            clone = Some(id);
+                            ui.close();
+                        }
+                        if ui.add_enabled(!only_one, egui::Button::new("🗑 Delete pattern and its clips")).on_disabled_hover_text("A project keeps at least one pattern").clicked() {
+                            delete = Some(id);
+                            ui.close();
+                        }
+                    });
+                }
+                if let Some(id) = clone.and_then(|id| self.project.clone_pattern(id)) {
+                    self.pattern = id;
+                }
+                if let Some(id) = delete {
+                    self.project.remove_pattern(id);
+                    self.fix_selection();
                 }
             });
         });
@@ -921,6 +1011,10 @@ impl eframe::App for App {
 
         // Send the project whenever it changed. If the queue was full, `sent` stays stale and it
         // goes out on the next frame.
+        // One undo step per settled edit: not while a button is held, a scroll is running or a
+        // text field has focus.
+        let settled = !ctx.input(|i| i.pointer.any_down() || i.smooth_scroll_delta != egui::Vec2::ZERO) && !ctx.egui_wants_keyboard_input();
+        self.history.observe(&self.project, settled);
         self.load_samples();
         if self.sent.as_ref() != Some(&self.project) || self.sent_rev != self.samples_rev {
             // Debug builds check that every edit keeps the project valid.

@@ -18,6 +18,8 @@ cargo run --release
 
 Knobs: drag up/down, scroll, or use the arrow keys; double-click resets.
 
+**Undo and redo** cover every edit (↶ ↷ in the toolbar, Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y); a drag or a scroll is one step. **Patterns:** ＋ New pattern in the browser or ＋ in the Channel Rack; right-click a pattern to rename, clone or delete it. **Tracks:** ＋ Track in the Playlist; right-click a track name to rename or delete it. **Channels:** right-click a channel's name in the Channel Rack to rename or delete it.
+
 ## Files
 
 - **File** menu: New (empty or the demo song), Open, Save, Save as. Projects are `.ritmo` files (readable JSON). `ritmo song.ritmo` opens a file from the terminal.
@@ -31,7 +33,7 @@ Knobs: drag up/down, scroll, or use the arrow keys; double-click resets.
 - `Z S X D C V G B H N J M` = C3 octave, `Q 2 W 3 E R 5 T 6 Y 7 U I 9 O 0 P` = C4 octave, played on the selected channel (outlined in the Channel Rack; the status bar names it).
 - On a chop channel the same keys play pads 1–16: `Z S X D C V G B H N J M Q 2 W 3`. While tap-chopping, **Enter** taps and **Esc** finishes.
 - **Space** = play/stop. **F5 / F6 / F7 / F8 / F9** = Playlist / Channel Rack / Piano Roll / Sampler / Mixer.
-- **Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S** = new / open / save / save as.
+- **Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S** = new / open / save / save as. **Ctrl+Z / Ctrl+Shift+Z (Ctrl+Y)** = undo / redo.
 - **Export** writes `~/Music/<project name>.wav` (or `ritmo-export.wav` before the first save): the song twice plus a 2 s tail.
 
 Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian/Ubuntu).

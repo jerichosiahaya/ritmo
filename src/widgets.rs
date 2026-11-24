@@ -97,6 +97,12 @@ pub fn knob(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>, default: f
     resp.on_hover_text(format!("{label}: {}", if lo < 0.0 { format!("{:+.0}", shown * 100.0) } else { format!("{:.0}%", shown * 100.0) }))
 }
 
+/// A right-click menu that stays open while you click inside it (so a text field in it can be
+/// focused); it closes on a click outside or when an item calls `ui.close()`.
+pub fn edit_menu(resp: &Response, add_contents: impl FnOnce(&mut Ui)) {
+    egui::Popup::context_menu(resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(add_contents);
+}
+
 /// Small round on/off light.
 pub fn led(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let (rect, mut resp) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::click());

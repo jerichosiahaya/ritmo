@@ -169,7 +169,7 @@ Meters / waveforms  ◄──── shots  ├─ inserts, sends, buses         
 | Release | Change | Why |
 |---|---|---|
 | v0.2 | **Project model with stable IDs** (tracks, clips, patterns, notes in collections) replacing the fixed-size `Song` | Unlimited content |
-| v0.2 | **Command-based editing**: every edit is an undoable command | Undo history, autosave, scripting later |
+| v0.2 | **Undo history** of whole-project states (projects are small; sample audio is not part of them), one step per settled edit ✅ | Undo/redo for every edit, current and future, without per-command inverses |
 | v0.2 | **Real-time-safe hand-off**: immutable engine snapshots sent through lock-free queues (`rtrb`); old snapshots go back to the UI thread to be freed | No allocation or locks on the audio thread |
 | v0.2 | **Versioned project files** (`serde`, RON/JSON + an audio folder) with migrations | Files keep opening across versions |
 | v0.2 | **Audio settings** on `cpal` (ALSA backend, which PipeWire serves) | Device, sample rate, buffer size |
@@ -247,7 +247,7 @@ gantt
 | 3 | 9 – 15 Dec | Save/open `.ritmo` files with a format version; autosave ✅ (done early, 24 Nov) |
 | 4 | 16 – 22 Dec | **Chop sampler, engine and files:** load WAV/FLAC/MP3/OGG, chop instrument (slices as notes), auto-chop at hits or in even slices, project format 2 ✅ (done early, 24 Nov) |
 | 5 | 23 – 29 Dec | **Chop sampler window:** waveform with draggable chop points, tap-to-chop, 16 pads on the keyboard, per-pad pitch, reverse and level; holiday buffer ✅ (done early, 24 Nov) |
-| 6 | 30 Dec – 5 Jan | Undo/redo (commands for steps, notes, clips, chops, mixer); new/rename/clone/delete patterns |
+| 6 | 30 Dec – 5 Jan | Undo/redo (commands for steps, notes, clips, chops, mixer); new/rename/clone/delete patterns ✅ (done early, 24 Nov; undo keeps whole-project states instead of per-command inverses; tracks and channels can be renamed and deleted too) |
 | 7 | 6 – 12 Jan | Free-form playlist: place, move, resize, copy, delete clips; longer songs; loop range |
 | 8 | 13 – 19 Jan | Piano roll: note length, velocity, selection, copy/paste, snap; metronome; octave shift; audio settings |
 | 9 | 20 – 26 Jan | **Feature freeze.** AppImage and AUR packaging; demo projects; test on Arch, Ubuntu and Fedora |

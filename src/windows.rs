@@ -76,11 +76,15 @@ fn rack(app: &mut App, ui: &mut Ui) {
             })
             .response
             .on_hover_text("Pattern whose steps the drum rows edit");
+        if ui.small_button("＋").on_hover_text("New empty pattern").clicked() {
+            app.pattern = app.project.new_pattern();
+        }
     });
     ui.add_space(2.0);
     let pat = app.pattern;
     let steps = app.project.pattern(pat).map_or(STEPS_PER_BAR, |p| (p.len / STEP) as usize).clamp(STEPS_PER_BAR, 4 * STEPS_PER_BAR);
     let playing_step = app.cur.and_then(|t| app.project.pattern_pos(pat, t)).map(|t| (t / STEP) as usize);
+    let mut delete = None;
     egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
         for i in 0..app.project.channels.len() {
             let color = channel_color(i);
@@ -101,7 +105,8 @@ fn rack(app: &mut App, ui: &mut Ui) {
                     Instrument::Chop => "Open in the Sampler",
                     _ => "Open in the piano roll",
                 };
-                if ui.add(btn).on_hover_text(hint).clicked() {
+                let resp = ui.add(btn).on_hover_text(format!("{hint} · right-click to rename or delete"));
+                if resp.clicked() {
                     if inst.is_drum() {
                         app.live = id;
                     } else if inst == Instrument::Chop {
@@ -110,6 +115,14 @@ fn rack(app: &mut App, ui: &mut Ui) {
                         app.edit_channel(id);
                     }
                 }
+                edit_menu(&resp, |ui| {
+                    ui.label(RichText::new("Name").small().weak());
+                    ui.text_edit_singleline(&mut app.project.channels[i].name);
+                    if ui.button("🗑 Delete channel and its notes").clicked() {
+                        delete = Some(id);
+                        ui.close();
+                    }
+                });
                 ui.add_space(6.0);
                 if inst.is_drum() {
                     ui.spacing_mut().item_spacing.x = 1.0;
@@ -128,6 +141,10 @@ fn rack(app: &mut App, ui: &mut Ui) {
             });
         }
     });
+    if let Some(id) = delete {
+        app.project.remove_channel(id);
+        app.fix_selection();
+    }
 }
 
 /// Melodic rows show what the channel plays across the song instead of step buttons.
@@ -306,6 +323,10 @@ fn playlist(app: &mut App, ui: &mut Ui) {
     // The song's bars plus one empty bar to extend into.
     let bars = (app.project.end().div_ceil(bl) + 1).max(4);
     let rows = app.project.tracks.len();
+    if ui.small_button("＋ Track").on_hover_text("Add an empty playlist track").clicked() {
+        app.project.new_track();
+    }
+    let mut delete = None;
     egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
         let size = vec2(LABEL_W + BAR_W * bars as f32, RULER_H + TRACK_H * rows as f32);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
@@ -329,9 +350,18 @@ fn playlist(app: &mut App, ui: &mut Ui) {
             let y = rect.top() + RULER_H + row as f32 * TRACK_H;
             // Track label: click mutes.
             let label = Rect::from_min_size(Pos2::new(rect.left(), y), vec2(LABEL_W - 4.0, TRACK_H)).shrink(2.0);
-            if ui.interact(label, ui.scope_id().with(("track", row)), Sense::click()).on_hover_text("Click to mute or unmute this track").clicked() {
+            let resp = ui.interact(label, ui.scope_id().with(("track", row)), Sense::click()).on_hover_text("Click to mute or unmute · right-click to rename or delete");
+            if resp.clicked() {
                 app.project.tracks[row].mute ^= true;
             }
+            edit_menu(&resp, |ui| {
+                ui.label(RichText::new("Name").small().weak());
+                ui.text_edit_singleline(&mut app.project.tracks[row].name);
+                if ui.button("🗑 Delete track and its clips").clicked() {
+                    delete = Some(track);
+                    ui.close();
+                }
+            });
             let p = ui.painter();
             p.rect_filled(label, 3, BG_WINDOW);
             p.rect_filled(Rect::from_min_size(label.min, vec2(4.0, label.height())), 2, if muted { Color32::from_gray(80) } else { channel_color(row * 2) });
@@ -414,6 +444,10 @@ fn playlist(app: &mut App, ui: &mut Ui) {
             ));
         }
     });
+    if let Some(id) = delete {
+        app.project.remove_track(id);
+        app.fix_selection();
+    }
 }
 
 /// Double-click on a clip: patterns with melodic notes open in the piano roll, drum patterns in
