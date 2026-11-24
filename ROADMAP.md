@@ -2,6 +2,8 @@
 
 **Goal:** a free, open-source, general-purpose DAW for **Linux**, written in Rust, that covers the whole production process (writing, sound design, recording, editing, arranging, mixing, mastering and delivery) well enough to finish professional-quality songs in any genre, from hip-hop and EDM to pop, rock, film scoring and podcasts.
 
+**Value proposition:** *A complete DAW for Linux that runs on just a laptop, with sample chopping built in.* Ritmo is a general-purpose DAW first: patterns and a playlist, a piano roll, a mixer, recording and plugins, for any genre. Its signature feature is the chop sampler: drop in any audio, chop it onto 16 pads in seconds (at the hits, in even slices or by tapping), flip it with pitch and reverse, and sequence the chops like any other instrument. Free and open source.
+
 **Platform:** Linux only for now. Windows and macOS are not planned before 1.0; the engine stays portable so a port stays possible later.
 
 **Starting point (v0.1, November 2026):** a 4-bar pattern sequencer with synth drums, an FM electric piano, a sine bass, a piano roll, a playlist, a 4-bus mixer with meters and one master effect chain. It has no save/load, no audio tracks, no samples and no plugins.
@@ -22,6 +24,7 @@
 4. **Industry standards.** CLAP, LV2 and VST3 plugins, MIDI and MIDI 2.0, WAV/FLAC/MP3 export, stems, LUFS loudness.
 5. **Audio quality comes first.** 32-bit float throughout (64-bit mix bus option), sample rates up to 192 kHz, sample-accurate automation, plugin delay compensation, no dropouts.
 6. **Runs on a laptop.** Light on CPU and memory, usable without a MIDI keyboard, scales up when you add hardware.
+7. **Sampling is a first-class workflow.** Chopping, flipping and resampling audio are as quick as programming drums; chops are ordinary notes, so every editor works with them.
 
 ### Who it is for
 
@@ -82,6 +85,7 @@ Supporting one platform instead of three saves about two months compared with a 
 - Piano roll: note length, velocity, selection, copy/paste, snap.
 - Metronome; typing-keyboard octave shift.
 - Audio settings: output device, sample rate, buffer size (PipeWire/ALSA through `cpal`).
+- **Chop sampler:** load WAV/FLAC/MP3/OGG, chop at the hits, into even slices or by tapping; 16 pads played from the keyboard; per-pad pitch, reverse and level; chops sequenced as notes in the Channel Rack, Piano Roll and Playlist.
 - GitHub Actions CI (build, test, clippy).
 - **Release package:** AppImage, AUR package (`ritmo-bin`), 2–3 demo projects, a short demo video, release notes that say clearly it is early access.
 
@@ -92,7 +96,7 @@ Not in v0.2 (moved to v0.3 or later): markers, tempo and time-signature changes,
 - Record from one or more inputs with monitoring; punch-in and punch-out.
 - Import WAV/FLAC/MP3/OGG/AIFF; browser with folders, search and preview.
 - Clip editing: trim, split, fade, crossfade, gain, reverse, normalize.
-- Sampler (one-shot and key-mapped), slicer (chop by beat or transient), drum machine with pads.
+- Sampler extensions: key-mapped (multi-octave) playback, time-stretched chops, resampling a flip into a new sample, CC0 starter sample packs. (The chop sampler itself moved up to v0.2.)
 - Simple time-stretch to fit loops to the project tempo.
 - Markers, time signature, tempo changes; record what you play into the piano roll.
 - Export WAV/FLAC/MP3 with a range choice. Flatpak package.
@@ -141,7 +145,7 @@ Not in v0.2 (moved to v0.3 or later): markers, tempo and time-signature changes,
 - Stable, versioned project-file format; user manual and website.
 
 #### After 1.0 (ideas, not committed)
-Windows and macOS ports, clip launcher for live performance, modular instrument, audio-to-MIDI, stem separation, surround/Atmos, network collaboration, scripting API, AI assistants, tablet/touch UI.
+Windows and macOS ports, an MCP server so AI agents can build and edit projects (for example "chop this record at the hits and make a 90 BPM beat"), clip launcher for live performance, modular instrument, audio-to-MIDI, stem separation, surround/Atmos, network collaboration, scripting API, AI assistants, tablet/touch UI.
 
 ---
 
@@ -241,9 +245,9 @@ gantt
 | 1 | 25 Nov – 1 Dec | CI (build, test, clippy); new project model with IDs, next to `Song` ✅ |
 | 2 | 2 – 8 Dec | Engine reads the new model through snapshots with deferred freeing; `assert_no_alloc` in debug builds ✅ (done early, 24 Nov; a small heap guard in `rt.rs` instead of the crate; the UI edits the project model too) |
 | 3 | 9 – 15 Dec | Save/open `.ritmo` files with a format version; autosave ✅ (done early, 24 Nov) |
-| 4 | 16 – 22 Dec | Undo/redo (commands for steps, notes, clips, mixer) |
-| 5 | 23 – 29 Dec | Holiday buffer; fix bugs |
-| 6 | 30 Dec – 5 Jan | Multiple patterns; pattern list in the browser |
+| 4 | 16 – 22 Dec | **Chop sampler, engine and files:** load WAV/FLAC/MP3/OGG, chop instrument (slices as notes), auto-chop at hits or in even slices, project format 2 |
+| 5 | 23 – 29 Dec | **Chop sampler window:** waveform with draggable chop points, tap-to-chop, 16 pads on the keyboard, per-pad pitch, reverse and level; holiday buffer |
+| 6 | 30 Dec – 5 Jan | Undo/redo (commands for steps, notes, clips, chops, mixer); new/rename/clone/delete patterns |
 | 7 | 6 – 12 Jan | Free-form playlist: place, move, resize, copy, delete clips; longer songs; loop range |
 | 8 | 13 – 19 Jan | Piano roll: note length, velocity, selection, copy/paste, snap; metronome; octave shift; audio settings |
 | 9 | 20 – 26 Jan | **Feature freeze.** AppImage and AUR packaging; demo projects; test on Arch, Ubuntu and Fedora |

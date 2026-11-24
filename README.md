@@ -1,6 +1,6 @@
 # Ritmo
 
-A pattern-based music app for making beats with only a laptop. Rust, egui, cpal.
+A complete DAW for Linux that runs on just a laptop, with sample chopping built in. Patterns and a playlist, a piano roll, a mixer and built-in instruments for any genre, plus a chop sampler: drop in any audio, chop it onto 16 pads, flip it and sequence it. Rust, egui, cpal. Early development; see [ROADMAP.md](ROADMAP.md).
 
 ```sh
 cargo run --release
