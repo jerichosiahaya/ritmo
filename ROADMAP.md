@@ -249,7 +249,7 @@ gantt
 | 5 | 23 – 29 Dec | **Chop sampler window:** waveform with draggable chop points, tap-to-chop, 16 pads on the keyboard, per-pad pitch, reverse and level; holiday buffer ✅ (done early, 24 Nov) |
 | 6 | 30 Dec – 5 Jan | Undo/redo (commands for steps, notes, clips, chops, mixer); new/rename/clone/delete patterns ✅ (done early, 24 Nov; undo keeps whole-project states instead of per-command inverses; tracks and channels can be renamed and deleted too) |
 | 7 | 6 – 12 Jan | Free-form playlist: place, move, resize, copy, delete clips; longer songs; loop range ✅ (done early, 25 Nov; clips repeat their pattern when stretched, file format 3; snap to bar/beat/step, zoom, multi-select) |
-| 8 | 13 – 19 Jan | Piano roll: note length, velocity, selection, copy/paste, snap; metronome; octave shift; audio settings |
+| 8 | 13 – 19 Jan | Piano roll: note length, velocity, selection, copy/paste, snap; metronome; octave shift; audio settings ✅ (done early, 25 Nov; also a velocity lane, box select, duplicate, arrow-key nudges, a keyboard that stays in view; settings saved per computer) |
 | 9 | 20 – 26 Jan | **Feature freeze.** AppImage and AUR packaging; demo projects; test on Arch, Ubuntu and Fedora |
 | 10 | 27 – 31 Jan | Demo video, release notes, tag **v0.2.0**, announce (r/linuxaudio, LinuxMusicians forum) |
 

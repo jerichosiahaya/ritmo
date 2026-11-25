@@ -4,6 +4,7 @@ mod history;
 mod project;
 mod rt;
 mod sample;
+mod settings;
 mod widgets;
 mod windows;
 
@@ -12,11 +13,12 @@ use eframe::egui::{self, Color32, Key, RichText};
 use engine::{Cmd, Engine, Instrument, METERS, SampleData, Snapshot, STEP};
 use std::collections::HashMap;
 use history::History;
-use project::{CHOP_BASE, CHORDS, ChannelId, ChordError, ClipId, MAX_SLICES, PatternId, Project, Tick, TrackId};
+use project::{CHOP_BASE, CHORDS, ChannelId, ChordError, ClipId, NoteId, MAX_SLICES, PatternId, Project, Tick, TrackId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+use settings::Settings;
 use widgets::*;
 
 /// Holds the audio stream open. `pos` is the playing tick + 1 (0 = stopped);
@@ -28,24 +30,49 @@ struct Audio {
     trash: mpsc::Receiver<Box<Snapshot>>,
     pos: Arc<AtomicUsize>,
     meters: Arc<[AtomicU32; METERS]>,
+    /// The device, sample rate and buffer in use, for the settings window.
+    info: String,
 }
 
-fn start_audio() -> Result<Audio, String> {
-    let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
-    let config = device.default_output_config().map_err(|e| e.to_string())?;
+/// Output devices: ID (to save in the settings) and name.
+fn output_devices() -> Vec<(String, String)> {
+    let devices = cpal::default_host().output_devices();
+    devices.map(|ds| ds.filter_map(|d| Some((d.id().ok()?.to_string(), d.to_string()))).collect()).unwrap_or_default()
+}
+
+/// Opens the output in `settings`; a saved device that is gone falls back to the default.
+fn start_audio(settings: &Settings) -> Result<Audio, String> {
+    let host = cpal::default_host();
+    let chosen = settings.device.as_ref().and_then(|id| id.parse::<cpal::DeviceId>().ok()).and_then(|id| host.device_by_id(&id));
+    let device = chosen.or_else(|| host.default_output_device()).ok_or("no audio output device")?;
+    let supported = device.default_output_config().map_err(|e| e.to_string())?;
+    let mut config = supported.config();
+    if let Some(n) = settings.buffer {
+        let n = match supported.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => n.clamp(*min, *max),
+            cpal::SupportedBufferSize::Unknown => n,
+        };
+        config.buffer_size = cpal::BufferSize::Fixed(n);
+    }
+    let sr = config.sample_rate;
+    let buffer = match config.buffer_size {
+        cpal::BufferSize::Fixed(n) => format!("{n} frames ({:.1} ms)", n as f32 * 1000.0 / sr as f32),
+        cpal::BufferSize::Default => "system buffer size".into(),
+    };
+    let info = format!("{device} · {sr} Hz · {buffer}");
     let (tx, rx) = engine::command_channel();
     let (trash_tx, trash) = engine::trash_channel();
     let pos = Arc::new(AtomicUsize::new(0));
     let meters: Arc<[AtomicU32; METERS]> = Arc::new(std::array::from_fn(|_| AtomicU32::new(0)));
     let shared = (rx, trash_tx, pos.clone(), meters.clone());
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => build::<f32>(&device, config.into(), shared),
-        cpal::SampleFormat::I16 => build::<i16>(&device, config.into(), shared),
-        cpal::SampleFormat::I32 => build::<i32>(&device, config.into(), shared),
+    let stream = match supported.sample_format() {
+        cpal::SampleFormat::F32 => build::<f32>(&device, config, shared),
+        cpal::SampleFormat::I16 => build::<i16>(&device, config, shared),
+        cpal::SampleFormat::I32 => build::<i32>(&device, config, shared),
         f => return Err(format!("unsupported sample format {f}")),
     }?;
     stream.play().map_err(|e| e.to_string())?;
-    Ok(Audio { _stream: stream, tx, trash, pos, meters })
+    Ok(Audio { _stream: stream, tx, trash, pos, meters, info })
 }
 
 type Shared = (mpsc::Receiver<Cmd>, mpsc::SyncSender<Box<Snapshot>>, Arc<AtomicUsize>, Arc<[AtomicU32; METERS]>);
@@ -80,7 +107,8 @@ fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(device: &cpal::Device, co
         .map_err(|e| e.to_string())
 }
 
-/// Typing keyboard as piano: bottom row = C3 octave, top row = C4 octave.
+/// Typing keyboard as piano: bottom row = C3 octave, top row = C4 octave (before the octave
+/// shift).
 fn key_note(k: Key) -> Option<u8> {
     use Key::*;
     let n = match k {
@@ -187,8 +215,27 @@ struct App {
     roll_low: u8,
     /// Channel the typing keyboard and the piano-roll keys play.
     live: ChannelId,
-    /// Piano-roll drag: Some(true) draws notes, Some(false) erases.
-    roll_paint: Option<bool>,
+    /// Piano roll: selected notes, a drag in progress, what it snaps to, the length new notes
+    /// get (the last one drawn or resized), whether it was clicked more recently than the
+    /// Playlist (Delete and Ctrl+C/V/X/A act on it then), the copied notes and where the next
+    /// paste goes.
+    roll_sel: Vec<NoteId>,
+    roll_drag: Option<windows::NoteDrag>,
+    roll_snap: windows::NoteSnap,
+    note_len: Tick,
+    roll_focus: bool,
+    clipboard: Vec<project::Note>,
+    paste_at: Tick,
+    /// Octaves the typing keyboard is shifted by (- and = keys), and the notes its held keys
+    /// started (released with the same pitch even if the octave changed meanwhile).
+    octave: i8,
+    held: Vec<(Key, u8)>,
+    /// Audio and metronome settings, the settings window's edited copy and the output devices
+    /// it lists.
+    settings: Settings,
+    settings_open: bool,
+    draft: Settings,
+    devices: Vec<(String, String)>,
     /// Note sounding from a click on the piano-roll keyboard.
     preview: Option<u8>,
     /// Playing tick, if playing.
@@ -233,7 +280,7 @@ impl Loaded {
 }
 
 impl App {
-    fn new(project: Project, path: Option<PathBuf>, audio: Option<Audio>, status: String) -> Self {
+    fn new(project: Project, path: Option<PathBuf>, audio: Option<Audio>, status: String, settings: Settings) -> Self {
         let mut app = App {
             sel_track: None,
             saved: Project::default(),
@@ -263,7 +310,19 @@ impl App {
             roll: (PatternId(0), ChannelId(0)),
             roll_low: 60,
             live: ChannelId(0),
-            roll_paint: None,
+            roll_sel: Vec::new(),
+            roll_drag: None,
+            roll_snap: windows::NoteSnap::Step,
+            note_len: STEP,
+            roll_focus: false,
+            clipboard: Vec::new(),
+            paste_at: 0,
+            octave: 0,
+            held: Vec::new(),
+            settings: settings.clone(),
+            settings_open: false,
+            draft: settings,
+            devices: Vec::new(),
             preview: None,
             cur: None,
             samples: HashMap::new(),
@@ -293,6 +352,7 @@ impl App {
         self.sel_track = project.tracks.first().map(|t| t.id);
         self.sel_bar = 0;
         (self.sel_clips, self.clip_drag) = (Vec::new(), None);
+        (self.roll_sel, self.roll_drag) = (Vec::new(), None);
         self.chop_ch = project.channels.iter().find(|c| c.chop.is_some()).map(|c| c.id);
         (self.chop_sel, self.chop_drag) = (0, None);
         self.tap = None;
@@ -471,6 +531,9 @@ impl App {
         }
         self.sel_clips.retain(|&id| p.clips.iter().any(|c| c.id == id));
         self.clip_drag = None;
+        let notes = p.pattern(self.roll.0).map_or(&[][..], |x| &x.notes[..]);
+        self.roll_sel.retain(|&id| notes.iter().any(|n| n.id == id && n.channel == self.roll.1));
+        self.roll_drag = None;
         if self.tap.as_ref().is_some_and(|t| p.chop(t.channel).is_none()) {
             self.tap = None;
         }
@@ -617,6 +680,28 @@ impl App {
             } else if hit(M::COMMAND, Key::Z) {
                 self.undo();
             }
+            // Piano roll: select all, duplicate, copy, cut, paste.
+            if self.roll_focused() {
+                if hit(M::COMMAND, Key::A) {
+                    let (pat, ch) = self.roll;
+                    self.roll_sel = self.project.pattern(pat).map_or(Vec::new(), |p| p.notes.iter().filter(|n| n.channel == ch).map(|n| n.id).collect());
+                } else if hit(M::COMMAND, Key::D) {
+                    let notes = self.roll_selection();
+                    if !notes.is_empty() {
+                        self.clipboard = notes;
+                        self.paste_at = self.clipboard_span().1;
+                        self.paste_notes();
+                    }
+                }
+                for ev in ctx.input(|i| i.events.clone()) {
+                    match ev {
+                        egui::Event::Copy => self.copy_notes(ctx, false),
+                        egui::Event::Cut => self.copy_notes(ctx, true),
+                        egui::Event::Paste(_) => self.paste_notes(),
+                        _ => {}
+                    }
+                }
+            }
         }
         if hit(M::COMMAND | M::SHIFT, Key::S) {
             self.save_as(Then::Nothing);
@@ -702,8 +787,162 @@ impl App {
         self.send(Cmd::Play(on));
     }
 
+    fn set_metronome(&mut self, on: bool) {
+        self.settings.metronome = on;
+        self.draft.metronome = on;
+        self.send(Cmd::Metronome(on));
+        self.save_settings();
+    }
+
+    fn save_settings(&mut self) {
+        if let Err(e) = self.settings.save() {
+            self.status = format!("Couldn't save settings: {e}");
+        }
+    }
+
+    /// Reopens the audio output with `new`; if that fails, goes back to the previous output.
+    fn restart_audio(&mut self, new: Settings) {
+        self.set_playing(false);
+        // Close the old stream first: some devices take one stream at a time.
+        self.audio = None;
+        match start_audio(&new) {
+            Ok(a) => {
+                self.status = format!("Audio: {}", a.info);
+                self.audio = Some(a);
+                self.settings = new;
+                self.save_settings();
+            }
+            Err(e) => {
+                self.status = format!("Couldn't open that output ({e}); back to the previous one.");
+                self.audio = start_audio(&self.settings).ok();
+            }
+        }
+        self.draft = self.settings.clone();
+        // The new engine starts empty: send it the song and the metronome.
+        self.sent = None;
+        self.send(Cmd::Metronome(self.settings.metronome));
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        egui::Window::new("Audio Settings").open(&mut open).resizable(false).collapsible(false).default_pos(egui::pos2(420.0, 140.0)).show(ctx, |ui| {
+            let current = self.audio.as_ref().map_or("No audio output".to_string(), |a| a.info.clone());
+            ui.label(RichText::new(current).small().weak());
+            ui.add_space(6.0);
+            egui::Grid::new("audio-settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Output");
+                let name = |id: &Option<String>| match id {
+                    None => "System default".to_string(),
+                    Some(id) => self.devices.iter().find(|(d, _)| d == id).map_or(id.clone(), |(_, n)| n.clone()),
+                };
+                let selected = name(&self.draft.device);
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("audio-device")
+                        .width(280.0)
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.draft.device, None, "System default");
+                            for (id, n) in &self.devices {
+                                ui.selectable_value(&mut self.draft.device, Some(id.clone()), n);
+                            }
+                        })
+                        .response
+                        .on_hover_text("Where Ritmo plays its sound");
+                    if ui.small_button("⟳").on_hover_text("Look for output devices again").clicked() {
+                        self.devices = output_devices();
+                    }
+                });
+                ui.end_row();
+                ui.label("Buffer");
+                let text = |b: Option<u32>| b.map_or("System default".to_string(), |n| format!("{n} frames"));
+                egui::ComboBox::from_id_salt("audio-buffer")
+                    .selected_text(text(self.draft.buffer))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.draft.buffer, None, text(None));
+                        for n in settings::BUFFERS {
+                            ui.selectable_value(&mut self.draft.buffer, Some(n), text(Some(n)));
+                        }
+                    })
+                    .response
+                    .on_hover_text("Smaller buffers make the keyboard and pads respond faster but need more of the computer. If the sound crackles, pick a bigger one.");
+                ui.end_row();
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let changed = self.draft.device != self.settings.device || self.draft.buffer != self.settings.buffer;
+                if ui.add_enabled(changed, egui::Button::new("Apply")).on_hover_text("Reopen the audio output with these settings").clicked() {
+                    self.restart_audio(self.draft.clone());
+                }
+                if ui.button("Restart audio").on_hover_text("Reopen the audio output, e.g. after plugging in headphones").clicked() {
+                    self.restart_audio(self.settings.clone());
+                }
+            });
+        });
+        self.settings_open = open;
+    }
+
     fn is_open(&self, w: Win) -> bool {
         self.open[w as usize]
+    }
+
+    fn live_is_chop(&self) -> bool {
+        self.project.channel(self.live).is_some_and(|c| c.instrument == Instrument::Chop)
+    }
+
+    /// Whether Delete, arrows and Ctrl+A/C/X/V/D act on the piano roll's notes (it was clicked
+    /// more recently than the Playlist and is open).
+    fn roll_focused(&self) -> bool {
+        self.roll_focus && self.is_open(Win::Roll)
+    }
+
+    /// The selected notes of the piano roll, earliest first.
+    fn roll_selection(&self) -> Vec<project::Note> {
+        let mut notes: Vec<project::Note> = self.project.pattern(self.roll.0).into_iter().flat_map(|p| p.notes.iter().filter(|n| self.roll_sel.contains(&n.id)).copied()).collect();
+        notes.sort_by_key(|n| (n.start, n.pitch));
+        notes
+    }
+
+    /// The span the clipboard's notes fill, in whole bars: pasting steps by it, so pasted notes
+    /// keep their place in the bar.
+    fn clipboard_span(&self) -> (Tick, Tick) {
+        let bl = self.project.bar_len();
+        let first = self.clipboard.iter().map(|n| n.start).min().unwrap_or(0) / bl * bl;
+        let last = self.clipboard.iter().map(|n| n.end()).max().unwrap_or(0).div_ceil(bl) * bl;
+        (first, last)
+    }
+
+    /// Copies (or cuts) the selected notes. A paste then goes right after them (after a cut: back
+    /// where they were).
+    fn copy_notes(&mut self, ctx: &egui::Context, cut: bool) {
+        let notes = self.roll_selection();
+        if notes.is_empty() {
+            return;
+        }
+        self.clipboard = notes;
+        let (first, last) = self.clipboard_span();
+        self.paste_at = if cut { first } else { last };
+        if cut {
+            self.project.remove_notes(self.roll.0, &self.roll_sel);
+            self.roll_sel.clear();
+        }
+        // Ctrl+V reaches the app only while the system clipboard holds text.
+        ctx.copy_text(format!("{} notes from Ritmo", self.clipboard.len()));
+        self.status = format!("{} {} notes", if cut { "Cut" } else { "Copied" }, self.clipboard.len());
+    }
+
+    /// Pastes the copied notes into the piano roll's pattern and channel, each paste after the
+    /// last; the pasted notes become the selection.
+    fn paste_notes(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        let (first, last) = self.clipboard_span();
+        let earliest = self.clipboard.iter().map(|n| n.start).min().unwrap_or(0);
+        let (pat, ch) = self.roll;
+        self.roll_sel = self.project.paste_notes(pat, ch, &self.clipboard, self.paste_at + earliest - first);
+        let bl = self.project.bar_len();
+        self.status = format!("Pasted {} notes at bar {}", self.roll_sel.len(), (self.paste_at + earliest - first) / bl + 1);
+        self.paste_at += last - first;
     }
 
     /// Engine index of the channel the keyboard plays.
@@ -778,14 +1017,37 @@ impl App {
             }
             if self.tap.is_some() && pressed && (key == Key::Enter || key == Key::Escape) {
                 if key == Key::Enter { self.tap() } else { self.finish_tap() }
-            } else if pressed && matches!(key, Key::Delete | Key::Backspace) && !self.sel_clips.is_empty() {
-                self.project.remove_clips(&self.sel_clips);
-                self.sel_clips.clear();
-            } else if pressed && key == Key::Escape {
-                // Cancels a playlist drag, else clears the clip selection.
-                if self.clip_drag.take().is_none() {
+            } else if pressed && matches!(key, Key::Delete | Key::Backspace) {
+                if self.roll_focused() {
+                    self.project.remove_notes(self.roll.0, &self.roll_sel);
+                    self.roll_sel.clear();
+                } else {
+                    self.project.remove_clips(&self.sel_clips);
                     self.sel_clips.clear();
                 }
+            } else if pressed && key == Key::Escape {
+                // Cancels a drag, else clears the selection.
+                if self.roll_focused() {
+                    if self.roll_drag.take().is_none() {
+                        self.roll_sel.clear();
+                    }
+                } else if self.clip_drag.take().is_none() {
+                    self.sel_clips.clear();
+                }
+            } else if pressed && matches!(key, Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight) {
+                // Arrows move the selected notes: a semitone (Shift: an octave) or a snap step.
+                if self.roll_focused() {
+                    let (dt, dp) = match key {
+                        Key::ArrowUp => (0, if modifiers.shift { 12 } else { 1 }),
+                        Key::ArrowDown => (0, if modifiers.shift { -12 } else { -1 }),
+                        Key::ArrowLeft => (-i64::from(self.roll_snap.ticks()), 0),
+                        _ => (i64::from(self.roll_snap.ticks()), 0),
+                    };
+                    self.project.shift_notes(self.roll.0, &self.roll_sel, dt, dp, false);
+                }
+            } else if pressed && matches!(key, Key::Minus | Key::Equals) {
+                self.octave = (self.octave + if key == Key::Equals { 1 } else { -1 }).clamp(-3, 3);
+                self.status = format!("Keyboard octave {:+}", self.octave);
             } else if let Some(&(w, _, _)) = WINDOWS.iter().find(|(_, _, k)| *k == key) {
                 if pressed {
                     self.open[w as usize] ^= true;
@@ -794,7 +1056,16 @@ impl App {
                 self.set_playing(!self.playing);
             } else if let Some(pitch) = key_note(key) {
                 let channel = self.live_index();
-                self.send(if pressed { Cmd::NoteOn { channel, pitch } } else { Cmd::NoteOff { channel, pitch } });
+                if pressed {
+                    // Chop pads stay on their keys; other instruments follow the octave shift.
+                    let shift = if self.live_is_chop() { 0 } else { 12 * i32::from(self.octave) };
+                    let pitch = (i32::from(pitch) + shift).clamp(0, 127) as u8;
+                    self.held.push((key, pitch));
+                    self.send(Cmd::NoteOn { channel, pitch });
+                } else if let Some(i) = self.held.iter().position(|&(k, _)| k == key) {
+                    let (_, pitch) = self.held.remove(i);
+                    self.send(Cmd::NoteOff { channel, pitch });
+                }
             }
         }
     }
@@ -820,6 +1091,9 @@ impl App {
             let (bar, step) = self.cur.map_or((1, 1), |t| (t / bl + 1, t % bl / STEP + 1));
             lcd(ui, &format!("{bar}:{step:02}"), &format!("{:.0} BPM\nBAR:STEP", self.project.bpm));
             ui.add(egui::DragValue::new(&mut self.project.bpm).range(50.0..=180.0).speed(0.5).suffix(" bpm")).on_hover_text("Tempo: drag or type");
+            if ui.add(egui::Button::selectable(self.settings.metronome, "♩ Click")).on_hover_text("Metronome: a click on every beat while playing (not exported)").clicked() {
+                self.set_metronome(!self.settings.metronome);
+            }
             ui.label("Swing");
             knob(ui, &mut self.project.swing, 0.5..=0.75, 0.6, "Swing", ACCENT);
             ui.label("Master");
@@ -834,6 +1108,13 @@ impl App {
             ui.separator();
             if ui.add_enabled(self.export_rx.is_none(), egui::Button::new("⬇ Export")).on_hover_text("Export WAV to ~/Music/ritmo-export.wav").clicked() {
                 self.export();
+            }
+            if ui.add(egui::Button::selectable(self.settings_open, "⚙ Audio")).on_hover_text("Audio settings: output device and buffer size").clicked() {
+                self.settings_open ^= true;
+                if self.settings_open {
+                    self.draft = self.settings.clone();
+                    self.devices = output_devices();
+                }
             }
         });
     }
@@ -995,7 +1276,9 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     let live = self.project.channel(self.live).map_or("—", |c| c.name.as_str());
-                    ui.label(RichText::new(format!("Keys play {live}: Z–M = C3 · Q–P = C4 · Space play/stop · F5 Playlist · F6 Rack · F7 Piano Roll · F8 Sampler · F9 Mixer")).small().weak());
+                    let oct = |base: i8| base + self.octave;
+                    let keys = if self.live_is_chop() { "Z–3 = pads 1–16".to_string() } else { format!("Z–M = C{} · Q–P = C{} (−/= octave)", oct(3), oct(4)) };
+                    ui.label(RichText::new(format!("Keys play {live}: {keys} · Space play/stop · F5 Playlist · F6 Rack · F7 Piano Roll · F8 Sampler · F9 Mixer")).small().weak());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(&self.status).small());
                         // Debug builds only: the real-time guard saw the audio thread use the heap.
@@ -1018,6 +1301,9 @@ impl eframe::App for App {
             .inner;
 
         windows::show(self, &ctx, area);
+        if self.settings_open {
+            self.settings_window(&ctx);
+        }
         self.ask_save_modal(&ctx);
 
         let title = format!("{}{} — Ritmo", if self.dirty() { "• " } else { "" }, self.file_name());
@@ -1062,7 +1348,8 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
-    let (audio, status) = match start_audio() {
+    let settings = Settings::load();
+    let (audio, status) = match start_audio(&settings) {
         Ok(a) => (Some(a), "Ready".to_string()),
         Err(e) => (None, format!("Audio unavailable ({e}); Export WAV still works.")),
     };
@@ -1076,7 +1363,8 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             apply_theme(&cc.egui_ctx);
             // `ritmo song.ritmo` opens that file; otherwise start with the demo song.
-            let mut app = App::new(Project::demo(), None, audio, status);
+            let mut app = App::new(Project::demo(), None, audio, status, settings);
+            app.send(Cmd::Metronome(app.settings.metronome));
             if let Some(path) = std::env::args_os().nth(1) {
                 app.open_file(PathBuf::from(path));
             }

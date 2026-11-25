@@ -152,11 +152,13 @@ pub struct Snapshot {
     /// Playback runs `loop_start..loop_end`, then wraps.
     pub loop_start: Tick,
     pub loop_end: Tick,
+    /// Length of a bar; the metronome accents its first beat.
+    pub bar: Tick,
 }
 
 impl Default for Snapshot {
     fn default() -> Self {
-        Snapshot { bpm: 120.0, swing: 0.5, fx: FX_NEUTRAL, channels: Vec::new(), mixer: Vec::new(), notes: Vec::new(), chops: Vec::new(), loop_start: 0, loop_end: 4 * PPQ }
+        Snapshot { bpm: 120.0, swing: 0.5, fx: FX_NEUTRAL, channels: Vec::new(), mixer: Vec::new(), notes: Vec::new(), chops: Vec::new(), loop_start: 0, loop_end: 4 * PPQ, bar: 4 * PPQ }
     }
 }
 
@@ -166,6 +168,8 @@ pub enum Cmd {
     /// Live notes (typing keyboard, piano-roll keys) on a channel index.
     NoteOn { channel: u16, pitch: u8 },
     NoteOff { channel: u16, pitch: u8 },
+    /// A click on every beat while playing, louder and higher on the first beat of a bar.
+    Metronome(bool),
 }
 
 /// Most commands the UI can queue before the audio thread drains them.
@@ -514,7 +518,20 @@ pub struct Engine {
     /// 0..1 gain on the vinyl noise: ramps to 1 while playing, to 0 when stopped.
     vinyl_amt: f32,
     peaks: [f32; METERS],
+    metronome: bool,
+    click: Click,
 }
+
+/// The metronome's click: a short decaying sine, added after the master chain.
+#[derive(Clone, Copy, Default)]
+struct Click {
+    t: f32,
+    freq: f32,
+    amp: f32,
+}
+
+/// How fast a click dies away, in seconds (time constant).
+const CLICK_DECAY: f32 = 0.012;
 
 impl Engine {
     pub fn new(sr: f32) -> Self {
@@ -540,6 +557,8 @@ impl Engine {
             fx: [FxChain::new(sr, 0, 0x9e37_79b9), FxChain::new(sr, 23, 0x7f4a_7c15)],
             vinyl_amt: 0.0,
             peaks: [0.0; METERS],
+            metronome: false,
+            click: Click::default(),
         }
     }
 
@@ -582,6 +601,7 @@ impl Engine {
                 self.release_seq();
             }
             Cmd::NoteOn { channel, pitch } => self.note_on(channel, pitch, 100, Tick::MAX, true),
+            Cmd::Metronome(on) => self.metronome = on,
             Cmd::NoteOff { channel, pitch } => {
                 for v in self.voices.iter_mut().filter(|v| v.live && v.channel == channel && v.note == pitch) {
                     v.gate = false;
@@ -701,6 +721,10 @@ impl Engine {
         for v in self.chop_voices.iter_mut().filter(|v| v.gate && !v.live && v.end <= t) {
             v.gate = false;
         }
+        if self.metronome && t.is_multiple_of(PPQ) {
+            let accent = self.snap.bar > 0 && t.is_multiple_of(self.snap.bar);
+            self.click = if accent { Click { t: 0.0, freq: 1760.0, amp: 0.5 } } else { Click { t: 0.0, freq: 1320.0, amp: 0.3 } };
+        }
         while let Some(&n) = self.snap.notes.get(self.cursor) {
             if n.start > t {
                 break;
@@ -778,6 +802,15 @@ impl Engine {
         let fx = Fx { vinyl: self.snap.fx.vinyl * self.vinyl_amt, ..self.snap.fx };
         let out = [self.fx[0].process(mix[0], &fx, self.sr), self.fx[1].process(mix[1], &fx, self.sr)];
         self.peaks[MASTER] = self.peaks[MASTER].max(out[0].abs()).max(out[1].abs());
+        let c = &mut self.click;
+        if c.amp > 0.0 {
+            let x = c.amp * (-c.t / CLICK_DECAY).exp() * (TAU * c.freq * c.t).sin();
+            c.t += self.dt;
+            if c.t > 10.0 * CLICK_DECAY {
+                c.amp = 0.0;
+            }
+            return [out[0] + x, out[1] + x];
+        }
         out
     }
 }
@@ -1015,6 +1048,29 @@ mod tests {
         assert_eq!((spec.channels, spec.sample_rate), (2, 44100));
         // The song once: 4 bars at 80 BPM = 12 s, plus 2 s tail.
         assert_eq!(frames as usize, (12.0 * 44100.0) as usize + 88200);
+    }
+
+    #[test]
+    fn metronome_clicks_on_every_beat() {
+        // 120 BPM at 8 kHz: a beat every 4000 frames; two bars of four beats.
+        let sr = 8000;
+        let mut s = snap(&[], &[]);
+        s.loop_end = 2 * s.bar;
+        let run = |on: bool| {
+            let mut e = Engine::new(sr as f32);
+            e.handle(Cmd::Snapshot(Box::new(s.clone())));
+            e.handle(Cmd::Metronome(on));
+            e.handle(Cmd::Play(true));
+            (0..8 * 4000).map(|_| e.next_frame()[0]).collect::<Vec<f32>>()
+        };
+        let out = run(true);
+        let peak = |a: usize| out[a..a + 200].iter().fold(0f32, |m, x| m.max(x.abs()));
+        let beats: Vec<f32> = (0..8).map(|b| peak(b * 4000)).collect();
+        // Each beat clicks; the first of each bar is louder; it has died away before the next.
+        assert!(beats.iter().all(|&p| p > 0.1), "{beats:?}");
+        assert!(beats[0] > beats[1] * 1.3 && beats[4] > beats[5] * 1.3, "{beats:?}");
+        assert!((0..8).all(|b| peak(b * 4000 + 1500) < 1e-3));
+        assert!(run(false).iter().all(|x| x.abs() < 1e-6));
     }
 
     #[test]

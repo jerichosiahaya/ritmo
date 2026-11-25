@@ -2,7 +2,7 @@
 //! `app.project` through its editing operations and draw previews from `app.snap`.
 
 use crate::engine::*;
-use crate::project::{CHOP_BASE, CHORDS, ChannelId, Clip, ClipId, Edge, MAX_BARS, MAX_SLICES, Note, PatternId, Project};
+use crate::project::{CHOP_BASE, CHORDS, ChannelId, Clip, ClipId, DEFAULT_VEL, Edge, MAX_BARS, MAX_SLICES, Note, NoteId, PatternId, Project};
 use crate::sample;
 use crate::widgets::*;
 use crate::{App, Win, channel_color, chord_color, pattern_color};
@@ -33,7 +33,7 @@ pub fn show(app: &mut App, ctx: &egui::Context, area: Rect) {
     let specs: [(Win, &str, Pos2, [f32; 2]); 5] = [
         (Win::Playlist, "Playlist", o + vec2(16.0, 16.0), [860.0, 236.0]),
         (Win::Rack, "Channel Rack", o + vec2(16.0, 290.0), [560.0, 250.0]),
-        (Win::Roll, &roll_title, o + vec2(80.0, 60.0), [760.0, 420.0]),
+        (Win::Roll, &roll_title, o + vec2(80.0, 40.0), [820.0, 530.0]),
         (Win::Mixer, "Mixer", o + vec2(600.0, 290.0), [620.0, 270.0]),
         (Win::Chop, &chop_title, o + vec2(120.0, 40.0), [760.0, 430.0]),
     ];
@@ -177,137 +177,396 @@ const KEY_W: f32 = 46.0;
 const CELL_W: f32 = 16.0;
 const ROW_H: f32 = 14.0;
 const RULER_H: f32 = 18.0;
+/// Height of the velocity lane under the notes, and the gap above it.
+const VEL_H: f32 = 56.0;
+const VEL_GAP: f32 = 6.0;
+/// How near a note's right end (in pixels) a drag changes its length instead of moving it.
+const NOTE_EDGE: f32 = 5.0;
+
+/// What piano-roll edits snap to. Holding Alt places freely.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum NoteSnap {
+    Beat,
+    Eighth,
+    Step,
+    ThirtySecond,
+}
+
+impl NoteSnap {
+    const ALL: [NoteSnap; 4] = [NoteSnap::Beat, NoteSnap::Eighth, NoteSnap::Step, NoteSnap::ThirtySecond];
+
+    pub fn ticks(self) -> Tick {
+        match self {
+            NoteSnap::Beat => PPQ,
+            NoteSnap::Eighth => PPQ / 2,
+            NoteSnap::Step => STEP,
+            NoteSnap::ThirtySecond => STEP / 2,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            NoteSnap::Beat => "1/4 (beat)",
+            NoteSnap::Eighth => "1/8",
+            NoteSnap::Step => "1/16 (step)",
+            NoteSnap::ThirtySecond => "1/32",
+        }
+    }
+}
+
+/// A piano-roll drag in progress. Like playlist drags, moves and resizes show their result and
+/// change the project when dropped. `grab` is where it was picked up: tick and row (from the
+/// top, fractional).
+pub enum NoteDrag {
+    /// Notes moved together (copied if Ctrl is held at the drop); `anchor` snaps to the grid.
+    Move { notes: Vec<NoteId>, anchor: NoteId, grab: (f32, f32) },
+    /// Notes made longer or shorter together, by dragging `anchor`'s end.
+    Resize { notes: Vec<NoteId>, anchor: NoteId, grab: f32 },
+    /// A selection box (Ctrl+drag on empty space).
+    Select { grab: (f32, f32) },
+    /// Painting velocities in the velocity lane; applied as it goes.
+    Velocity,
+}
+
+/// Applies `drag` to `p` as if dropped at tick `tick`, row `row`; returns the notes to select
+/// after it (None: keep the selection).
+fn drop_note_drag(p: &mut Project, (pat, ch, top): (PatternId, ChannelId, u8), drag: &NoteDrag, tick: f32, row: f32, unit: Tick, copy: bool) -> Option<Vec<NoteId>> {
+    let snap = |t: f32| (t / unit as f32).round().max(0.0) as Tick * unit;
+    let note = |p: &Project, id| p.pattern(pat).and_then(|x| x.notes.iter().find(|n| n.id == id).copied());
+    match drag {
+        NoteDrag::Move { notes, anchor, grab } => {
+            let a = note(p, *anchor)?;
+            let dt = i64::from(snap(a.start as f32 + tick - grab.0)) - i64::from(a.start);
+            let dp = -(row - grab.1).round() as i64;
+            Some(p.shift_notes(pat, notes, dt, dp, copy))
+        }
+        NoteDrag::Resize { notes, anchor, grab } => {
+            let a = note(p, *anchor)?;
+            let end = snap(a.end() as f32 + tick - grab).max(a.start + unit);
+            p.resize_notes(pat, notes, i64::from(end) - i64::from(a.end()), unit.min(a.len).max(1));
+            Some(notes.clone())
+        }
+        NoteDrag::Select { grab } => {
+            let (t0, t1) = (grab.0.min(tick).max(0.0) as Tick, grab.0.max(tick).ceil() as Tick);
+            let pitch = |r: f32| (i64::from(top) - r.floor() as i64).clamp(0, 127) as u8;
+            let (lo, hi) = (pitch(grab.1.max(row)), pitch(grab.1.min(row)));
+            Some(p.notes_in(pat, ch, t0, t1.max(t0 + 1), lo, hi))
+        }
+        NoteDrag::Velocity => None,
+    }
+}
 
 fn piano_roll(app: &mut App, ui: &mut Ui) {
     let (pat, ch) = app.roll;
-    let (Some(channel), Some(pattern)) = (app.project.channel(ch), app.project.pattern(pat)) else {
+    let (Some(channel), Some(_)) = (app.project.channel(ch), app.project.pattern(pat)) else {
         ui.label("Pick a channel in the Channel Rack or the browser to edit its notes.");
         return;
     };
     let (ch_name, color) = (channel.name.clone(), channel_color(app.project.channel_index(ch).unwrap_or(0)));
     let is_chop = channel.instrument == Instrument::Chop;
     let ch_index = app.project.channel_index(ch).map_or(u16::MAX, |i| i as u16);
-    let steps = ((pattern.len / STEP) as usize).max(STEPS_PER_BAR);
+    let bl = app.project.bar_len();
     ui.horizontal(|ui| {
         ui.label(RichText::new(&ch_name).color(color).strong());
         if ui.button("Clear").on_hover_text(format!("Remove all of {ch_name}'s notes from this pattern")).clicked()
             && let Some(p) = app.project.pattern_mut(pat)
         {
             p.notes.retain(|n| n.channel != ch);
+            app.roll_sel.clear();
         }
         let top = 127 - ROLL_KEYS as u8 + 1;
-        if ui.add_enabled(app.roll_low < top, egui::Button::new("▲")).on_hover_text("Octave up").clicked() {
+        if ui.add_enabled(app.roll_low < top, egui::Button::new("▲")).on_hover_text("Show an octave higher").clicked() {
             app.roll_low = (app.roll_low + 12).min(top);
         }
-        if ui.add_enabled(app.roll_low > 0, egui::Button::new("▼")).on_hover_text("Octave down").clicked() {
+        if ui.add_enabled(app.roll_low > 0, egui::Button::new("▼")).on_hover_text("Show an octave lower").clicked() {
             app.roll_low = app.roll_low.saturating_sub(12);
         }
-        ui.label(RichText::new("Left-drag draws · right-drag erases · click a key to hear it").small().weak());
+        ui.separator();
+        ui.label("Snap");
+        egui::ComboBox::from_id_salt("roll-snap")
+            .width(90.0)
+            .selected_text(app.roll_snap.name())
+            .show_ui(ui, |ui| {
+                for s in NoteSnap::ALL {
+                    ui.selectable_value(&mut app.roll_snap, s, s.name());
+                }
+            })
+            .response
+            .on_hover_text("What notes snap to. Hold Alt while dragging to place freely.");
+        ui.label(RichText::new("Click: add · drag: move · drag the end: length · Ctrl+drag: select · right-click: delete").small().weak())
+            .on_hover_text("New notes get the length of the last note you drew, resized or clicked.\nCtrl+drag a note copies it. Delete removes the selection; arrows move it (Shift+↑↓: an octave).\nCtrl+A selects all, Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste, Ctrl+D duplicates.\nThe lane under the notes sets velocity: drag over a note's stem.");
     });
     let low = app.roll_low;
+    let top_pitch = low + ROLL_KEYS as u8 - 1;
+    let (alt, command, pointer) = ui.input(|i| (i.modifiers.alt, i.modifiers.command, i.pointer.latest_pos()));
+    let unit = if alt { 1 } else { app.roll_snap.ticks() };
     egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-        let size = vec2(KEY_W + CELL_W * steps as f32, RULER_H + ROW_H * ROLL_KEYS as f32);
-        let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
-        let grid = Rect::from_min_max(rect.min + vec2(KEY_W, RULER_H), rect.max);
-        let pitch_at = |y: f32| {
-            let row = ((y - grid.top()) / ROW_H).floor();
-            (0.0..ROLL_KEYS as f32).contains(&row).then(|| low + (ROLL_KEYS - 1) as u8 - row as u8)
-        };
+        let top_left = ui.cursor().min;
+        let gx = top_left.x + KEY_W;
+        let gy = top_left.y + RULER_H;
+        let tick_at = |x: f32| ((x - gx) / CELL_W * STEP as f32).max(0.0);
+        let row_at = |y: f32| (y - gy) / ROW_H;
+        let px = |t: Tick| gx + t as f32 / STEP as f32 * CELL_W;
 
-        // Interaction: draw/erase cells, or preview from the keyboard.
-        let pointer = resp.is_pointer_button_down_on().then(|| resp.interact_pointer_pos()).flatten();
-        match pointer.and_then(|p| pitch_at(p.y).map(|n| (p, n))) {
-            Some((p, pitch)) if p.x < grid.left() => {
-                if app.preview != Some(pitch) {
-                    if let Some(old) = app.preview {
-                        app.send(Cmd::NoteOff { channel: ch_index, pitch: old });
+        // While moving, resizing or box-selecting, draw the result of dropping here.
+        let mut preview = None;
+        let mut selected = app.roll_sel.clone();
+        if let (Some(drag), Some(pos)) = (&app.roll_drag, pointer)
+            && !matches!(drag, NoteDrag::Velocity)
+        {
+            let mut p = app.project.clone();
+            if let Some(sel) = drop_note_drag(&mut p, (pat, ch, top_pitch), drag, tick_at(pos.x), row_at(pos.y), unit, command) {
+                selected = sel;
+            }
+            if !matches!(drag, NoteDrag::Select { .. }) {
+                preview = Some(p);
+            }
+        }
+        // What to draw: this channel's notes, each with whether a playlist clip plays it.
+        let (notes, audible, pattern_len, playhead) = {
+            let project = preview.as_ref().unwrap_or(&app.project);
+            let Some(pattern) = project.pattern(pat) else { return };
+            let notes: Vec<Note> = pattern.notes.iter().filter(|n| n.channel == ch).copied().collect();
+            let audible: Vec<bool> = notes.iter().map(|n| project.clips.iter().any(|c| c.pattern == pat && project.clip_plays(c, n.start))).collect();
+            (notes, audible, pattern.len, app.cur.and_then(|t| project.pattern_pos(pat, t)))
+        };
+        // The pattern, plus a bar to grow into.
+        let ticks = (pattern_len.div_ceil(bl) + 1) * bl;
+        let steps = (ticks / STEP) as usize;
+        let size = vec2(KEY_W + CELL_W * steps as f32, RULER_H + ROW_H * ROLL_KEYS as f32 + VEL_GAP + VEL_H);
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        let grid = Rect::from_min_max(Pos2::new(gx, gy), Pos2::new(rect.right(), gy + ROW_H * ROLL_KEYS as f32));
+        // The keyboard stays at the left edge when scrolled sideways, drawn over the notes.
+        let kx = rect.left().max(ui.clip_rect().left());
+        let keys = Rect::from_min_max(Pos2::new(kx, gy), Pos2::new(kx + KEY_W, grid.bottom()));
+        let lane = Rect::from_min_max(Pos2::new(gx, grid.bottom() + VEL_GAP), rect.max);
+        let pitch_at = |y: f32| {
+            let row = row_at(y).floor();
+            (0.0..ROLL_KEYS as f32).contains(&row).then(|| top_pitch - row as u8)
+        };
+        let note_rect = |n: &Note| {
+            let y = gy + (top_pitch - n.pitch) as f32 * ROW_H;
+            Rect::from_min_max(Pos2::new(px(n.start), y), Pos2::new(px(n.end()), y + ROW_H)).shrink(1.0)
+        };
+        let visible = low..=top_pitch;
+        let hit = |pos: Pos2| notes.iter().rev().filter(|n| visible.contains(&n.pitch)).find(|n| note_rect(n).expand(1.0).contains(pos)).copied();
+
+        // Keyboard: hold a key to hear it.
+        let kresp = ui.interact(keys, ui.scope_id().with("roll-keys"), Sense::drag()).on_hover_text("Hold a key to hear it");
+        let key_held = kresp.is_pointer_button_down_on().then(|| kresp.interact_pointer_pos()).flatten().and_then(|p| pitch_at(p.y));
+
+        // Notes.
+        let gresp = ui.interact(grid, ui.scope_id().with("roll-grid"), Sense::click_and_drag());
+        if let Some(h) = gresp.hover_pos()
+            && app.roll_drag.is_none()
+            && hit(h).is_some_and(|n| h.x > note_rect(&n).right() - NOTE_EDGE)
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if gresp.is_pointer_button_down_on() || gresp.clicked() || gresp.secondary_clicked() {
+            app.roll_focus = true;
+        }
+        let pressed = ui.input(|i| i.pointer.primary_pressed());
+        let mut sound = None;
+        if gresp.drag_started_by(egui::PointerButton::Primary)
+            && let Some(o) = ui.input(|i| i.pointer.press_origin())
+        {
+            let grab = (tick_at(o.x), row_at(o.y));
+            app.roll_drag = match hit(o) {
+                Some(n) => {
+                    if !app.roll_sel.contains(&n.id) {
+                        app.roll_sel = vec![n.id];
                     }
-                    app.send(Cmd::NoteOn { channel: ch_index, pitch });
-                    app.preview = Some(pitch);
+                    let picked = app.roll_sel.clone();
+                    Some(if o.x > note_rect(&n).right() - NOTE_EDGE {
+                        NoteDrag::Resize { notes: picked, anchor: n.id, grab: grab.0 }
+                    } else {
+                        NoteDrag::Move { notes: picked, anchor: n.id, grab }
+                    })
+                }
+                None if command => Some(NoteDrag::Select { grab }),
+                // On empty space a drag draws a note and moves it.
+                None => pitch_at(o.y).and_then(|pitch| {
+                    let at = tick_at(o.x) as Tick / unit * unit;
+                    let id = app.project.draw_note(pat, ch, pitch, at, app.note_len, DEFAULT_VEL)?;
+                    app.roll_sel = vec![id];
+                    Some(NoteDrag::Move { notes: vec![id], anchor: id, grab })
+                }),
+            };
+        } else if gresp.clicked()
+            && let Some(pos) = gresp.interact_pointer_pos()
+        {
+            match hit(pos) {
+                Some(n) if command => {
+                    if let Some(i) = app.roll_sel.iter().position(|&s| s == n.id) {
+                        app.roll_sel.remove(i);
+                    } else {
+                        app.roll_sel.push(n.id);
+                    }
+                }
+                Some(n) => {
+                    app.roll_sel = vec![n.id];
+                    app.note_len = n.len;
+                }
+                None if command => app.roll_sel.clear(),
+                None => {
+                    if let Some(pitch) = pitch_at(pos.y) {
+                        let at = tick_at(pos.x) as Tick / unit * unit;
+                        app.roll_sel = app.project.draw_note(pat, ch, pitch, at, app.note_len, DEFAULT_VEL).into_iter().collect();
+                    }
                 }
             }
-            Some((p, pitch)) => {
-                let step = (((p.x - grid.left()) / CELL_W) as usize).min(steps - 1) as Tick;
-                let erase = ui.input(|i| i.pointer.secondary_down());
-                let draw = *app.roll_paint.get_or_insert(!erase && !app.project.cell(pat, ch, pitch, step));
-                app.project.set_cell(pat, ch, pitch, step, draw);
-            }
-            None => {}
         }
-        if pointer.is_none() {
-            app.roll_paint = None;
-            if let Some(n) = app.preview.take() {
-                app.send(Cmd::NoteOff { channel: ch_index, pitch: n });
+        // Hear the note being pressed or dragged.
+        if gresp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down()) {
+            sound = match &app.roll_drag {
+                Some(NoteDrag::Move { anchor, .. } | NoteDrag::Resize { anchor, .. }) => notes.iter().find(|n| n.id == *anchor).map(|n| n.pitch),
+                Some(_) => None,
+                None if pressed => pointer.and_then(|p| hit(p).map(|n| n.pitch).or_else(|| pitch_at(p.y))),
+                None => app.preview,
+            };
+        }
+        // Right button: delete the notes it touches.
+        if gresp.is_pointer_button_down_on()
+            && ui.input(|i| i.pointer.secondary_down())
+            && let Some(n) = pointer.and_then(hit)
+        {
+            app.project.remove_notes(pat, &[n.id]);
+            app.roll_sel.retain(|&s| s != n.id);
+        }
+
+        // Velocity lane: drag over notes' stems to set how hard they play.
+        let vresp = ui.interact(lane, ui.scope_id().with("roll-velocity"), Sense::click_and_drag()).on_hover_text("Velocity: drag up or down over a note's stem (in a chord, the selected notes)");
+        if (vresp.is_pointer_button_down_on() || vresp.clicked())
+            && let Some(pos) = vresp.interact_pointer_pos()
+        {
+            app.roll_focus = true;
+            app.roll_drag.get_or_insert(NoteDrag::Velocity);
+            let vel = ((lane.bottom() - pos.y) / VEL_H * 127.0).round().clamp(1.0, 127.0) as u8;
+            let near = (CELL_W * 0.5).max(4.0);
+            // Notes sharing a column (a chord): the selected ones, if any are there.
+            let under: Vec<NoteId> = notes.iter().filter(|n| (px(n.start) - pos.x).abs() <= near).map(|n| n.id).collect();
+            let picked: Vec<NoteId> = under.iter().copied().filter(|id| app.roll_sel.contains(id)).collect();
+            app.project.set_velocity(pat, if picked.is_empty() { &under } else { &picked }, vel);
+        }
+
+        // Drop a drag when the button comes up.
+        if app.roll_drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            let drag = app.roll_drag.take().expect("checked above");
+            if let Some(pos) = pointer
+                && let Some(sel) = drop_note_drag(&mut app.project, (pat, ch, top_pitch), &drag, tick_at(pos.x), row_at(pos.y), unit, command)
+            {
+                app.roll_sel = sel;
+                if let NoteDrag::Resize { anchor, .. } | NoteDrag::Move { anchor, .. } = drag
+                    && let Some(n) = app.project.pattern(pat).and_then(|p| p.notes.iter().find(|n| n.id == anchor))
+                {
+                    app.note_len = n.len;
+                }
             }
+        }
+
+        // Preview sound: keyboard, or the note under the pointer.
+        let want = key_held.or(sound);
+        if app.preview != want {
+            if let Some(old) = app.preview {
+                app.send(Cmd::NoteOff { channel: ch_index, pitch: old });
+            }
+            if let Some(n) = want {
+                app.send(Cmd::NoteOn { channel: ch_index, pitch: n });
+            }
+            app.preview = want;
         }
 
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0, BG_DEEP);
         // Ruler.
         for s in (0..steps).step_by(4) {
-            let x = grid.left() + s as f32 * CELL_W;
-            if s % STEPS_PER_BAR == 0 {
-                p.text(Pos2::new(x + 3.0, rect.top() + RULER_H / 2.0), Align2::LEFT_CENTER, format!("{}", s / STEPS_PER_BAR + 1), FontId::proportional(12.0), Color32::from_gray(200));
+            let x = gx + s as f32 * CELL_W;
+            if (s as Tick * STEP).is_multiple_of(bl) {
+                p.text(Pos2::new(x + 3.0, rect.top() + RULER_H / 2.0), Align2::LEFT_CENTER, format!("{}", s as Tick * STEP / bl + 1), FontId::proportional(12.0), Color32::from_gray(200));
             } else {
                 p.line_segment([Pos2::new(x, rect.top() + RULER_H - 5.0), Pos2::new(x, rect.top() + RULER_H)], Stroke::new(1.0, Color32::from_gray(110)));
             }
         }
-        // Rows and keyboard.
+        // Rows.
         for k in 0..ROLL_KEYS {
-            let pitch = low + (ROLL_KEYS - 1 - k) as u8;
             // Chop pads aren't notes of a scale: every row is a plain row.
-            let black = !is_chop && is_black(pitch);
-            let y = grid.top() + k as f32 * ROW_H;
-            let row = Rect::from_min_size(Pos2::new(grid.left(), y), vec2(grid.width(), ROW_H));
+            let black = !is_chop && is_black(top_pitch - k as u8);
+            let row = Rect::from_min_size(Pos2::new(gx, gy + k as f32 * ROW_H), vec2(grid.width(), ROW_H));
             p.rect_filled(row, 0, if black { Color32::from_rgb(36, 40, 45) } else { Color32::from_rgb(47, 52, 58) });
-            // Black keys are shorter, drawn over the white key area like a real keyboard.
-            let key_w = if black { (KEY_W - 2.0) * 0.62 } else { KEY_W - 2.0 };
-            let key = Rect::from_min_size(Pos2::new(rect.left(), y), vec2(key_w, ROW_H));
-            if black {
-                p.rect_filled(Rect::from_min_size(Pos2::new(rect.left(), y), vec2(KEY_W - 2.0, ROW_H)), 0, Color32::from_rgb(222, 222, 216));
-            }
-            let fill = match (black, app.preview == Some(pitch)) {
-                (_, true) => ACCENT,
-                (true, _) => Color32::from_rgb(28, 28, 30),
-                (false, _) => Color32::from_rgb(222, 222, 216),
-            };
-            p.rect_filled(key.shrink2(vec2(0.0, 0.5)), 1, fill);
-            if is_chop {
-                if let Some(pad) = pitch.checked_sub(CHOP_BASE).filter(|&k| (k as usize) < MAX_SLICES) {
-                    p.text(key.right_center() - vec2(4.0, 0.0), Align2::RIGHT_CENTER, format!("Pad {}", pad + 1), FontId::proportional(9.0), Color32::from_gray(60));
-                }
-            } else if pitch.is_multiple_of(12) {
-                p.text(key.right_center() - vec2(4.0, 0.0), Align2::RIGHT_CENTER, note_name(pitch), FontId::proportional(10.0), Color32::from_gray(60));
-            }
         }
-        // Grid lines.
+        let draw_keys = |p: &egui::Painter| {
+            p.rect_filled(keys.expand2(vec2(0.0, RULER_H)).with_max_y(lane.bottom()), 0, BG_DEEP);
+            for k in 0..ROLL_KEYS {
+                let pitch = top_pitch - k as u8;
+                let black = !is_chop && is_black(pitch);
+                let y = gy + k as f32 * ROW_H;
+                // Black keys are shorter, drawn over the white key area like a real keyboard.
+                let key_w = if black { (KEY_W - 2.0) * 0.62 } else { KEY_W - 2.0 };
+                let key = Rect::from_min_size(Pos2::new(kx, y), vec2(key_w, ROW_H));
+                if black {
+                    p.rect_filled(Rect::from_min_size(Pos2::new(kx, y), vec2(KEY_W - 2.0, ROW_H)), 0, Color32::from_rgb(222, 222, 216));
+                }
+                let fill = match (black, app.preview == Some(pitch)) {
+                    (_, true) => ACCENT,
+                    (true, _) => Color32::from_rgb(28, 28, 30),
+                    (false, _) => Color32::from_rgb(222, 222, 216),
+                };
+                p.rect_filled(key.shrink2(vec2(0.0, 0.5)), 1, fill);
+                if is_chop {
+                    if let Some(pad) = pitch.checked_sub(CHOP_BASE).filter(|&k| (k as usize) < MAX_SLICES) {
+                        p.text(key.right_center() - vec2(4.0, 0.0), Align2::RIGHT_CENTER, format!("Pad {}", pad + 1), FontId::proportional(9.0), Color32::from_gray(60));
+                    }
+                } else if pitch.is_multiple_of(12) {
+                    p.text(key.right_center() - vec2(4.0, 0.0), Align2::RIGHT_CENTER, note_name(pitch), FontId::proportional(10.0), Color32::from_gray(60));
+                }
+            }
+        };
+        // Grid lines; the pattern's end.
         for s in 0..=steps {
-            let x = grid.left() + s as f32 * CELL_W;
-            let (w, c) = match s {
-                s if s % STEPS_PER_BAR == 0 => (1.5, Color32::from_gray(120)),
-                s if s % 4 == 0 => (1.0, Color32::from_gray(78)),
+            let x = gx + s as f32 * CELL_W;
+            let t = s as Tick * STEP;
+            let (w, c) = match t {
+                t if t.is_multiple_of(bl) => (1.5, Color32::from_gray(120)),
+                t if t.is_multiple_of(PPQ) => (1.0, Color32::from_gray(78)),
                 _ => (1.0, Color32::from_gray(56)),
             };
-            p.line_segment([Pos2::new(x, grid.top()), Pos2::new(x, grid.bottom())], Stroke::new(w, c));
+            p.line_segment([Pos2::new(x, grid.top()), Pos2::new(x, lane.bottom())], Stroke::new(w, c));
         }
-        // Notes; dimmed where no playlist clip plays that part of the pattern.
-        let project = &app.project;
-        let audible = |t: Tick| project.clips.iter().any(|c| c.pattern == pat && project.clip_plays(c, t));
-        let px = |t: Tick| grid.left() + t as f32 / STEP as f32 * CELL_W;
-        let visible = low..low.saturating_add(ROLL_KEYS as u8);
-        for n in project.pattern(pat).into_iter().flat_map(|p| &p.notes).filter(|n| n.channel == ch && visible.contains(&n.pitch)) {
-            let y = grid.top() + (low + ROLL_KEYS as u8 - 1 - n.pitch) as f32 * ROW_H;
-            let r = Rect::from_min_max(Pos2::new(px(n.start), y), Pos2::new(px(n.end()), y + ROW_H)).shrink(1.0);
-            let col = if audible(n.start) { color } else { color.gamma_multiply(0.35) };
+        let end = px(pattern_len);
+        p.rect_filled(Rect::from_min_max(Pos2::new(end, grid.top()), grid.max), 0, Color32::from_black_alpha(70));
+        // Notes: brighter when louder, dimmed where no playlist clip plays that part of the
+        // pattern, outlined when selected.
+        for (n, &heard) in notes.iter().zip(&audible).filter(|(n, _)| visible.contains(&n.pitch)) {
+            let r = note_rect(n);
+            let loud = 0.45 + 0.55 * n.vel as f32 / 127.0;
+            let col = if heard { color.gamma_multiply(loud) } else { color.gamma_multiply(0.3) };
             p.rect_filled(r, 3, col);
-            p.rect_stroke(r, 3, Stroke::new(1.0, col.gamma_multiply(0.5)), StrokeKind::Inside);
+            let outline = if selected.contains(&n.id) { Stroke::new(2.0, Color32::WHITE) } else { Stroke::new(1.0, col.gamma_multiply(0.5)) };
+            p.rect_stroke(r, 3, outline, StrokeKind::Inside);
             if r.width() > 26.0 {
                 p.text(r.left_center() + vec2(3.0, 0.0), Align2::LEFT_CENTER, note_name(n.pitch), FontId::proportional(9.0), CLIP_TEXT);
             }
         }
-        if let Some(t) = app.cur.and_then(|t| project.pattern_pos(pat, t)) {
-            p.line_segment([Pos2::new(px(t), rect.top()), Pos2::new(px(t), grid.bottom())], Stroke::new(2.0, ACCENT_HOT));
+        // Velocity stems.
+        p.rect_filled(lane, 0, BG_PANEL.gamma_multiply(0.6));
+        for n in &notes {
+            let x = px(n.start) + 1.5;
+            let y = lane.bottom() - n.vel as f32 / 127.0 * (VEL_H - 4.0);
+            let col = if selected.contains(&n.id) { Color32::WHITE } else { color };
+            p.line_segment([Pos2::new(x, lane.bottom()), Pos2::new(x, y)], Stroke::new(2.0, col));
+            p.circle_filled(Pos2::new(x, y), 2.5, col);
         }
+        if let (Some(NoteDrag::Select { grab }), Some(pos)) = (&app.roll_drag, pointer) {
+            let from = Pos2::new(px(grab.0 as Tick), gy + grab.1 * ROW_H);
+            let r = Rect::from_two_pos(from, pos).intersect(grid);
+            p.rect_filled(r, 0, ACCENT.gamma_multiply(0.15));
+            p.rect_stroke(r, 0, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
+        }
+        if let Some(t) = playhead {
+            p.line_segment([Pos2::new(px(t), rect.top()), Pos2::new(px(t), lane.bottom())], Stroke::new(2.0, ACCENT_HOT));
+        }
+        draw_keys(&p);
     });
 }
 
@@ -538,6 +797,7 @@ fn playlist(app: &mut App, ui: &mut Ui) {
             if resp.clicked()
                 && let Some(pos) = resp.interact_pointer_pos()
             {
+                app.roll_focus = false;
                 let at = tick_at(pos.x) as Tick / unit * unit;
                 if let Some(c) = app.project.place_clip(track, app.pattern, at) {
                     app.sel_clips = vec![c];
@@ -559,6 +819,9 @@ fn playlist(app: &mut App, ui: &mut Ui) {
                     }
                 };
                 let is_sel = selected.contains(&c.id);
+                if resp.is_pointer_button_down_on() {
+                    app.roll_focus = false;
+                }
                 if app.clip_drag.is_none()
                     && let Some(h) = resp.hover_pos()
                     && edge_at(h.x).is_some()

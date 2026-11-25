@@ -288,11 +288,6 @@ impl Project {
         Some(id)
     }
 
-    #[allow(dead_code)] // Note-level editing arrives with the piano-roll upgrade (week 8).
-    pub fn remove_note(&mut self, pattern: PatternId, note: NoteId) -> bool {
-        self.pattern_mut(pattern).is_some_and(|p| remove(&mut p.notes, |n| n.id == note) > 0)
-    }
-
     pub fn remove_clip(&mut self, id: ClipId) -> bool {
         remove(&mut self.clips, |c| c.id == id) > 0
     }
@@ -387,7 +382,7 @@ impl Project {
         notes.sort_by_key(|n| (n.start, n.channel, n.pitch));
 
         let (loop_start, loop_end) = self.loop_range.unwrap_or(self.song_range());
-        Snapshot { bpm: self.bpm, swing: self.swing, fx: self.master, channels, mixer, notes, chops, loop_start, loop_end }
+        Snapshot { bpm: self.bpm, swing: self.swing, fx: self.master, channels, mixer, notes, chops, loop_start, loop_end, bar: self.bar_len() }
     }
 
     /// Checks every invariant: unique IDs no higher than the counter, references that resolve,
@@ -490,41 +485,6 @@ impl Project {
             }
         } else {
             self.add_note(pattern, channel, STEP_PITCH, step * STEP, STEP, DEFAULT_VEL);
-        }
-    }
-
-    /// Whether a note of `channel` at `pitch` sounds during 16th `step` of `pattern`.
-    pub fn cell(&self, pattern: PatternId, channel: ChannelId, pitch: u8, step: Tick) -> bool {
-        let t = step * STEP;
-        self.pattern(pattern).is_some_and(|p| p.notes.iter().any(|n| n.channel == channel && n.pitch == pitch && n.start <= t && t < n.end()))
-    }
-
-    /// Piano-roll painting on the 16th grid. Turning a cell on joins it with notes that end or
-    /// start right next to it; turning it off splits the note it was part of.
-    pub fn set_cell(&mut self, pattern: PatternId, channel: ChannelId, pitch: u8, step: Tick, on: bool) {
-        let (t, next) = (step * STEP, step * STEP + STEP);
-        let Some(p) = self.pattern_mut(pattern) else { return };
-        let same = |n: &Note| n.channel == channel && n.pitch == pitch;
-        let covering = p.notes.iter().position(|n| same(n) && n.start <= t && t < n.end());
-        match (on, covering) {
-            (true, None) => {
-                let left = p.notes.iter().position(|n| same(n) && n.end() == t).map(|i| p.notes.remove(i));
-                let right = p.notes.iter().position(|n| same(n) && n.start == next).map(|i| p.notes.remove(i));
-                let start = left.map_or(t, |n| n.start);
-                let end = right.map_or(next, |n| n.end());
-                let vel = left.or(right).map_or(DEFAULT_VEL, |n| n.vel);
-                self.add_note(pattern, channel, pitch, start, end - start, vel);
-            }
-            (false, Some(i)) => {
-                let n = p.notes.remove(i);
-                if n.start < t {
-                    self.add_note(pattern, channel, pitch, n.start, t - n.start, n.vel);
-                }
-                if next < n.end() {
-                    self.add_note(pattern, channel, pitch, next, n.end() - next, n.vel);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -855,6 +815,106 @@ pub enum ChordError {
 pub enum Edge {
     Start,
     End,
+}
+
+/// Piano-roll editing: notes picked by ID. Notes that end past their pattern grow it, in whole
+/// bars, so clips that repeat the pattern stay in time.
+impl Project {
+    /// Grows `pattern` to whole bars covering all of its notes.
+    fn fit_pattern(&mut self, pattern: PatternId) {
+        let bl = self.bar_len();
+        if let Some(p) = self.pattern_mut(pattern) {
+            let need = p.notes.iter().map(Note::end).max().unwrap_or(0).div_ceil(bl) * bl;
+            p.len = p.len.max(need);
+        }
+    }
+
+    /// The last tick a note may reach.
+    fn max_note_end(&self) -> Tick {
+        MAX_BARS * self.bar_len()
+    }
+
+    /// Adds a note from the piano roll; the pattern grows to whole bars if needed.
+    pub fn draw_note(&mut self, pattern: PatternId, channel: ChannelId, pitch: u8, start: Tick, len: Tick, vel: u8) -> Option<NoteId> {
+        let len = len.min(self.max_note_end().checked_sub(start)?);
+        let id = self.add_note(pattern, channel, pitch, start, len, vel)?;
+        self.fit_pattern(pattern);
+        Some(id)
+    }
+
+    /// The notes of `channel` in `pattern` that overlap ticks `t0..t1` with a pitch in `lo..=hi`.
+    pub fn notes_in(&self, pattern: PatternId, channel: ChannelId, t0: Tick, t1: Tick, lo: u8, hi: u8) -> Vec<NoteId> {
+        let hit = |n: &&Note| n.channel == channel && n.start < t1 && t0 < n.end() && (lo..=hi).contains(&n.pitch);
+        self.pattern(pattern).into_iter().flat_map(|p| p.notes.iter().filter(hit).map(|n| n.id)).collect()
+    }
+
+    fn picked(&self, pattern: PatternId, notes: &[NoteId]) -> Vec<Note> {
+        self.pattern(pattern).into_iter().flat_map(|p| p.notes.iter().filter(|n| notes.contains(&n.id)).copied()).collect()
+    }
+
+    /// Limits a move of `notes` by `dt` ticks and `dp` semitones so they stay after tick 0,
+    /// inside the song limit and in MIDI range.
+    pub fn clamp_note_shift(&self, pattern: PatternId, notes: &[NoteId], dt: i64, dp: i64) -> (i64, i64) {
+        let picked = self.picked(pattern, notes);
+        let (Some(first), Some(last)) = (picked.iter().map(|n| n.start).min(), picked.iter().map(Note::end).max()) else { return (0, 0) };
+        let (lo, hi) = (picked.iter().map(|n| n.pitch).min().unwrap_or(0), picked.iter().map(|n| n.pitch).max().unwrap_or(0));
+        (dt.clamp(-i64::from(first), i64::from(self.max_note_end()) - i64::from(last)), dp.clamp(-i64::from(lo), 127 - i64::from(hi)))
+    }
+
+    /// Moves `notes` by `dt` ticks and `dp` semitones (limited by `clamp_note_shift`), or leaves
+    /// them and adds moved copies. Returns the moved notes or the copies.
+    pub fn shift_notes(&mut self, pattern: PatternId, notes: &[NoteId], dt: i64, dp: i64, copy: bool) -> Vec<NoteId> {
+        let (dt, dp) = self.clamp_note_shift(pattern, notes, dt, dp);
+        let moved: Vec<Note> = self.picked(pattern, notes).into_iter().map(|n| Note { start: (i64::from(n.start) + dt) as Tick, pitch: (i64::from(n.pitch) + dp) as u8, ..n }).collect();
+        let ids = if copy {
+            moved.iter().filter_map(|n| self.add_note(pattern, n.channel, n.pitch, n.start, n.len, n.vel)).collect()
+        } else {
+            if let Some(p) = self.pattern_mut(pattern) {
+                for n in p.notes.iter_mut() {
+                    if let Some(m) = moved.iter().find(|m| m.id == n.id) {
+                        *n = *m;
+                    }
+                }
+            }
+            moved.iter().map(|n| n.id).collect()
+        };
+        self.fit_pattern(pattern);
+        ids
+    }
+
+    /// Lengthens (or shortens) each of `notes` by `dl` ticks, keeping each at least `min` long.
+    pub fn resize_notes(&mut self, pattern: PatternId, notes: &[NoteId], dl: i64, min: Tick) {
+        let max_end = i64::from(self.max_note_end());
+        if let Some(p) = self.pattern_mut(pattern) {
+            for n in p.notes.iter_mut().filter(|n| notes.contains(&n.id)) {
+                let len = (i64::from(n.len) + dl).clamp(i64::from(min.max(1)), (max_end - i64::from(n.start)).max(1));
+                n.len = len as Tick;
+            }
+        }
+        self.fit_pattern(pattern);
+    }
+
+    pub fn set_velocity(&mut self, pattern: PatternId, notes: &[NoteId], vel: u8) {
+        if let Some(p) = self.pattern_mut(pattern) {
+            for n in p.notes.iter_mut().filter(|n| notes.contains(&n.id)) {
+                n.vel = vel.clamp(1, 127);
+            }
+        }
+    }
+
+    pub fn remove_notes(&mut self, pattern: PatternId, notes: &[NoteId]) {
+        if let Some(p) = self.pattern_mut(pattern) {
+            p.notes.retain(|n| !notes.contains(&n.id));
+        }
+    }
+
+    /// Copies of `notes` on `channel`, moved so the earliest starts at `at`. Returns the copies.
+    pub fn paste_notes(&mut self, pattern: PatternId, channel: ChannelId, notes: &[Note], at: Tick) -> Vec<NoteId> {
+        let Some(first) = notes.iter().map(|n| n.start).min() else { return Vec::new() };
+        let ids = notes.iter().filter_map(|n| self.draw_note(pattern, channel, n.pitch, at + n.start - first, n.len, n.vel)).collect();
+        self.fit_pattern(pattern);
+        ids
+    }
 }
 
 /// Managing patterns and tracks.
@@ -1199,31 +1259,6 @@ mod tests {
     }
 
     #[test]
-    fn cells_join_and_split() {
-        let (mut p, ch, pat, ..) = tiny();
-        let notes = |p: &Project| {
-            let mut v: Vec<(Tick, Tick, u8)> = p.pattern(pat).unwrap().notes.iter().filter(|n| n.pitch == 72).map(|n| (n.start / STEP, n.len / STEP, n.vel)).collect();
-            v.sort();
-            v
-        };
-        p.set_cell(pat, ch, 72, 0, true);
-        p.pattern_mut(pat).unwrap().notes.iter_mut().filter(|n| n.pitch == 72).for_each(|n| n.vel = 77);
-        p.set_cell(pat, ch, 72, 2, true);
-        p.set_cell(pat, ch, 72, 1, true); // joins 0 and 2, keeping the velocity
-        assert_eq!(notes(&p), [(0, 3, 77)]);
-        p.set_cell(pat, ch, 72, 1, true); // already on
-        assert_eq!(notes(&p), [(0, 3, 77)]);
-        p.set_cell(pat, ch, 72, 1, false); // splits
-        assert_eq!(notes(&p), [(0, 1, 77), (2, 1, 77)]);
-        assert!(p.cell(pat, ch, 72, 2) && !p.cell(pat, ch, 72, 1));
-        p.set_cell(pat, ch, 72, 0, false);
-        p.set_cell(pat, ch, 72, 2, false);
-        p.set_cell(pat, ch, 72, 5, false); // already off
-        assert_eq!(notes(&p), []);
-        p.validate().unwrap();
-    }
-
-    #[test]
     fn chords_stamp_and_detect() {
         let mut p = Project::demo();
         let (chords, melody) = (named(&p, "Chords").id, named(&p, "Melody").id);
@@ -1293,6 +1328,47 @@ mod tests {
         assert_eq!(p.stamp_chord_on_bar(drums, 40, 1), Err(ChordError::NoClip));
         let (mut q, _, _, tr, _) = tiny(); // drums only
         assert_eq!(q.stamp_chord_on_bar(tr, 0, 1), Err(ChordError::NoKeys));
+    }
+
+    #[test]
+    fn piano_roll_edits_notes() {
+        let (mut p, ch, pat, ..) = tiny();
+        let n = |p: &Project, id: NoteId| *p.pattern(pat).unwrap().notes.iter().find(|n| n.id == id).unwrap();
+        let a = p.draw_note(pat, ch, 60, STEP, STEP, 90).unwrap();
+        let b = p.draw_note(pat, ch, 64, 2 * STEP, 2 * STEP, 70).unwrap();
+        // Box selection: overlap in time and pitch range.
+        assert_eq!(p.notes_in(pat, ch, STEP + 1, 2 * STEP + 1, 59, 65), [a, b]);
+        assert_eq!(p.notes_in(pat, ch, 0, 4 * STEP, 61, 65), [b]);
+
+        // Moving up a fifth and a beat later keeps IDs; past the pattern it grows by whole bars.
+        assert_eq!(p.shift_notes(pat, &[a, b], i64::from(PPQ), 7, false), [a, b]);
+        assert_eq!((n(&p, a).start, n(&p, a).pitch, n(&p, b).pitch), (STEP + PPQ, 67, 71));
+        p.shift_notes(pat, &[b], i64::from(BAR), 0, false);
+        assert_eq!(p.pattern(pat).unwrap().len, 2 * BAR);
+        // Limits: not before 0, not out of MIDI range.
+        assert_eq!(p.clamp_note_shift(pat, &[a, b], -i64::from(10 * BAR), 100), (-i64::from(STEP + PPQ), 56));
+        // Copies get new IDs and leave the originals.
+        let copies = p.shift_notes(pat, &[a], 0, -12, true);
+        assert!(copies.len() == 1 && copies[0] != a && n(&p, a).pitch == 67 && n(&p, copies[0]).pitch == 55);
+
+        // Length: by the same amount each, never below the minimum.
+        p.resize_notes(pat, &[a, b], i64::from(STEP), STEP);
+        assert_eq!((n(&p, a).len, n(&p, b).len), (2 * STEP, 3 * STEP));
+        p.resize_notes(pat, &[a, b], -i64::from(BAR), STEP);
+        assert_eq!((n(&p, a).len, n(&p, b).len), (STEP, STEP));
+        p.set_velocity(pat, &[a], 0);
+        assert_eq!((n(&p, a).vel, n(&p, b).vel), (1, 70));
+
+        // Paste: the earliest copied note lands at `at`; the rest keep their places.
+        let clip: Vec<Note> = [a, b].iter().map(|&id| n(&p, id)).collect();
+        let pasted = p.paste_notes(pat, ch, &clip, 3 * BAR);
+        let starts: Vec<Tick> = pasted.iter().map(|&id| n(&p, id).start).collect();
+        assert_eq!(starts, [3 * BAR, 3 * BAR + BAR + STEP]);
+        assert_eq!(p.pattern(pat).unwrap().len, 5 * BAR);
+        p.remove_notes(pat, &pasted);
+        assert!(p.pattern(pat).unwrap().notes.iter().all(|n| !pasted.contains(&n.id)));
+        assert!(p.draw_note(pat, ch, 60, p.max_end(), STEP, 90).is_none());
+        p.validate().unwrap();
     }
 
     #[test]
