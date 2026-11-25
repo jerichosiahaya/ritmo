@@ -545,6 +545,64 @@ impl Project {
         true
     }
 
+    /// Puts `CHORDS[chord]` on playlist bar `bar` of `track`, in the clip playing there. If that
+    /// bar of the pattern also plays anywhere else in the song, the chord gets a bar of its own
+    /// first, so nothing else changes: a copy of the bar at the pattern's end, or (when some
+    /// clip repeats the pattern, which a longer pattern would change) a new one-bar pattern.
+    pub fn stamp_chord_on_bar(&mut self, track: TrackId, bar: Tick, chord: usize) -> Result<(), ChordError> {
+        let bl = self.bar_len();
+        let (a, b) = (bar * bl, bar * bl + bl);
+        let c = *self.clip_at(track, a).ok_or(ChordError::NoClip)?;
+        self.channel_for(c.pattern, Instrument::Rhodes).ok_or(ChordError::NoKeys)?;
+        let at = self.clip_pos(&c, a - c.start);
+        let shared = self.plays_at(c.pattern, at, at + bl).iter().any(|&(s, e)| s < a || e > b);
+        if !shared {
+            self.stamp_chord(c.pattern, at, bl, chord);
+            return Ok(());
+        }
+        let Some(p) = self.pattern(c.pattern).cloned() else { return Err(ChordError::NoClip) };
+        // Whether any clip, apart from the bar being replaced, repeats the pattern.
+        self.clear_range(track, a, b, &[]);
+        let repeats = self.clips.iter().any(|x| x.pattern == p.id && x.offset % p.len.max(1) + x.len > p.len);
+        let (pattern, start) = if repeats {
+            let names = (2..).map(|n| format!("{} {n}", p.name));
+            let name = Self::free_name(std::iter::once(format!("{} bar {}", p.name, bar + 1)).chain(names), self.patterns.iter().map(|p| p.name.as_str()));
+            (self.add_pattern(&name, bl), 0)
+        } else {
+            let start = p.len.div_ceil(bl) * bl;
+            if let Some(q) = self.pattern_mut(p.id) {
+                q.len = start + bl;
+            }
+            (p.id, start)
+        };
+        for n in p.notes.iter().filter(|n| (at..at + bl).contains(&n.start)) {
+            self.add_note(pattern, n.channel, n.pitch, start + n.start - at, n.len.min(at + bl - n.start), n.vel);
+        }
+        self.add_clip_at(track, pattern, a, bl, start);
+        self.join_clips(track);
+        self.stamp_chord(pattern, start, bl, chord);
+        Ok(())
+    }
+
+    /// Song time spans (start, end) in which ticks `lo..hi` of `pattern` play, from every clip.
+    fn plays_at(&self, pattern: PatternId, lo: Tick, hi: Tick) -> Vec<(Tick, Tick)> {
+        let Some(len) = self.pattern(pattern).map(|p| p.len).filter(|&l| l > 0) else { return Vec::new() };
+        let mut out = Vec::new();
+        for c in self.clips.iter().filter(|c| c.pattern == pattern) {
+            // Each pass plays pattern ticks pos..pos + seg from song tick `song`.
+            let (mut song, mut pos) = (c.start, c.offset % len);
+            while song < c.end() {
+                let seg = (len - pos).min(c.end() - song);
+                let (x, y) = (pos.max(lo), (pos + seg).min(hi));
+                if x < y {
+                    out.push((song + x - pos, song + y - pos));
+                }
+                (song, pos) = (song + seg, 0);
+            }
+        }
+        out
+    }
+
     /// Index into `CHORDS` of the chord the electric-piano notes starting at `start` spell, or 0.
     /// Chords voiced alike (Dm9 and Fmaj7) are told apart by the bass note.
     pub fn chord_at(&self, pattern: PatternId, start: Tick) -> usize {
@@ -781,6 +839,15 @@ impl Project {
         let (a, b) = (a.min(b), a.max(b).min(self.max_end()));
         self.loop_range = (a < b).then_some((a, b));
     }
+}
+
+/// Why a chord could not go on a playlist bar.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ChordError {
+    /// No clip plays there.
+    NoClip,
+    /// No electric-piano channel to play it.
+    NoKeys,
 }
 
 /// Which edge of a clip a resize drags.
@@ -1178,6 +1245,54 @@ mod tests {
 
         let (mut q, _, pat, ..) = tiny(); // drums only: nowhere to put a chord
         assert!(!q.stamp_chord(pat, 0, BAR, 1));
+    }
+
+    /// Every note the song plays, outside song ticks `a..b`.
+    fn song_outside(p: &Project, a: Tick, b: Tick) -> Vec<(Tick, Tick, u16, u8)> {
+        p.compile().notes.iter().filter(|n| n.start < a || n.start >= b).map(|n| (n.start, n.end, n.channel, n.pitch)).collect()
+    }
+
+    #[test]
+    fn a_chord_on_a_shared_bar_gets_its_own() {
+        let mut p = Project::demo();
+        let (chords_track, drums, beat) = (track_named(&p, "Chords"), track_named(&p, "Drums"), named(&p, "Pattern 1").id);
+        let chords = named(&p, "Chords").id;
+        // Bar 2 of the chords plays once: the chord goes straight in.
+        p.stamp_chord_on_bar(chords_track, 1, 6).unwrap();
+        assert_eq!((p.chord_at(chords, BAR), named(&p, "Chords").len), (6, 4 * BAR));
+
+        // A bar placed past the end plays the pattern's bar 1 again. Fmaj7 there must not turn
+        // bar 1 into Fmaj7: the pattern gets a fifth bar, and the clips join into one.
+        p.toggle_bar(chords_track, 4, beat);
+        let before = song_outside(&p, 4 * BAR, 5 * BAR);
+        p.stamp_chord_on_bar(chords_track, 4, 5).unwrap();
+        assert_eq!(song_outside(&p, 4 * BAR, 5 * BAR), before);
+        assert_eq!((p.chord_at(chords, 0), p.chord_at(chords, 4 * BAR), named(&p, "Chords").len), (1, 5, 5 * BAR));
+        assert_eq!(clips_on(&p, chords_track), [(0, 5 * BAR, 0)]);
+        // Stamping it again changes that bar only.
+        p.stamp_chord_on_bar(chords_track, 4, 7).unwrap();
+        assert_eq!((p.chord_at(chords, 4 * BAR), named(&p, "Chords").len), (7, 5 * BAR));
+        p.validate().unwrap();
+
+        // A clip that repeats a pattern: making the pattern longer would change it, so the bar
+        // becomes a pattern of its own, starting from a copy of the drums there.
+        p.remove_clips(&p.clips.iter().filter(|c| c.track == drums).map(|c| c.id).collect::<Vec<_>>());
+        p.add_clip(drums, beat, 0, 4 * BAR).unwrap();
+        let before = song_outside(&p, BAR, 2 * BAR);
+        let drum_notes = named(&p, "Pattern 1").notes.len();
+        p.stamp_chord_on_bar(drums, 1, 2).unwrap();
+        assert_eq!(song_outside(&p, BAR, 2 * BAR), before);
+        let own = named(&p, "Pattern 1 bar 2");
+        assert_eq!((own.len, own.notes.len(), p.chord_at(own.id, 0)), (BAR, drum_notes + 5, 2));
+        assert_eq!(named(&p, "Pattern 1").len, BAR);
+        let mut on_drums: Vec<_> = p.clips.iter().filter(|c| c.track == drums).map(|c| (c.start, c.len, c.pattern == own.id)).collect();
+        on_drums.sort();
+        assert_eq!(on_drums, [(0, BAR, false), (BAR, BAR, true), (2 * BAR, 2 * BAR, false)]);
+        p.validate().unwrap();
+
+        assert_eq!(p.stamp_chord_on_bar(drums, 40, 1), Err(ChordError::NoClip));
+        let (mut q, _, _, tr, _) = tiny(); // drums only
+        assert_eq!(q.stamp_chord_on_bar(tr, 0, 1), Err(ChordError::NoKeys));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use eframe::egui::{self, Color32, Key, RichText};
 use engine::{Cmd, Engine, Instrument, METERS, SampleData, Snapshot, STEP};
 use std::collections::HashMap;
 use history::History;
-use project::{CHOP_BASE, CHORDS, ChannelId, ClipId, MAX_SLICES, PatternId, Project, Tick, TrackId};
+use project::{CHOP_BASE, CHORDS, ChannelId, ChordError, ClipId, MAX_SLICES, PatternId, Project, Tick, TrackId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -736,16 +736,13 @@ impl App {
         self.edit_in_roll(pattern, channel);
     }
 
-    /// Stamps chord `j` on the playlist bar `bar` of `track`, in whatever clip plays there.
+    /// Puts chord `j` on playlist bar `bar` of `track` (see `Project::stamp_chord_on_bar`).
     fn stamp_chord(&mut self, track: TrackId, bar: Tick, j: usize) {
-        let bl = self.project.bar_len();
-        let Some(c) = self.project.clip_at(track, bar * bl).copied() else {
-            self.status = "Pick a bar that has a clip to put the chord in.".into();
-            return;
+        self.status = match self.project.stamp_chord_on_bar(track, bar, j) {
+            Ok(()) => return,
+            Err(ChordError::NoClip) => "Pick a bar that has a clip to put the chord in.".into(),
+            Err(ChordError::NoKeys) => "Chords need an electric-piano channel in the Channel Rack.".into(),
         };
-        if !self.project.stamp_chord(c.pattern, self.project.clip_pos(&c, bar * bl - c.start), bl, j) {
-            self.status = "Chords need an electric-piano channel in the Channel Rack.".into();
-        }
     }
 
     /// Exports the whole song, whatever the loop range.
