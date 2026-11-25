@@ -23,6 +23,13 @@ pub const CH_COLORS: [Color32; 6] = [
 ];
 
 pub fn apply_theme(ctx: &egui::Context) {
+    // Only egui's bundled fonts are used, so text looks the same on every system. The monospace
+    // font covers symbols the others lack (◆ ↶ ↷ ▲ ▼ ▤ ▦ →), so it goes last for all text.
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.push("Hack".into());
+    }
+    ctx.set_fonts(fonts);
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG_PANEL;
     v.window_fill = BG_WINDOW;

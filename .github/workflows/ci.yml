@@ -21,3 +21,38 @@ jobs:
       - run: cargo build --locked
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
+
+  # Builds and tests with each distribution's own Rust and libraries, as its packages would.
+  distro:
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["archlinux:latest", "fedora:latest"]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install Rust and ALSA
+        run: |
+          if command -v pacman >/dev/null; then
+            pacman -Syu --noconfirm --needed base-devel rust alsa-lib
+          else
+            dnf install -y gcc cargo rust alsa-lib-devel pkgconf-pkg-config
+          fi
+      - uses: actions/checkout@v4
+      - run: cargo test --locked --release
+
+  # The AppImage, built on the oldest supported Ubuntu so it runs on anything newer.
+  appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ALSA headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: packaging/appimage.sh
+      - run: APPIMAGE_EXTRACT_AND_RUN=1 ./Ritmo-*.AppImage --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: Ritmo-*.AppImage

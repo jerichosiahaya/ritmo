@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod demos;
 mod engine;
 mod file;
 mod history;
@@ -120,6 +122,29 @@ fn key_note(k: Key) -> Option<u8> {
     Some(n)
 }
 
+/// The demo projects that came with Ritmo: in `share/ritmo/demos` next to the program (installed
+/// or in the AppImage), else in the source tree when run with `cargo run`. The startup song is
+/// built in, so its file is left out.
+fn demo_files() -> Vec<PathBuf> {
+    let exe = std::env::current_exe().ok();
+    let installed = exe.as_ref().and_then(|e| e.parent()).map(|bin| bin.join("../share/ritmo/demos"));
+    // `cargo run`: target/{debug,release}/ritmo, with demos/ two levels up.
+    let checkout = exe.as_ref().and_then(|e| e.parent()).map(|bin| bin.join("../../demos"));
+    let dirs = installed.into_iter().chain([PathBuf::from("/usr/share/ritmo/demos")]).chain(checkout);
+    let Some(dir) = dirs.into_iter().find(|d| d.is_dir()) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == file::EXTENSION)).collect();
+    files.retain(|p| p.file_stem().is_none_or(|s| s != "lofi-loop"));
+    files.sort();
+    files
+}
+
+/// "boom-bap-chops.ritmo" → "Boom bap chops".
+fn demo_name(path: &Path) -> String {
+    let stem = path.file_stem().map_or(String::new(), |s| s.to_string_lossy().replace('-', " "));
+    let mut c = stem.chars();
+    c.next().map_or(stem.clone(), |f| f.to_uppercase().chain(c).collect())
+}
+
 /// Floating windows, in toolbar order.
 #[derive(Clone, Copy, PartialEq)]
 enum Win {
@@ -157,6 +182,8 @@ enum Then {
     Nothing,
     New { demo: bool },
     Open,
+    /// Opens `App::demos[i]` as a new, unsaved project.
+    OpenDemo(usize),
     Quit,
 }
 
@@ -236,6 +263,8 @@ struct App {
     settings_open: bool,
     draft: Settings,
     devices: Vec<(String, String)>,
+    /// Demo projects found on disk (File ▸ Open a demo).
+    demos: Vec<PathBuf>,
     /// Note sounding from a click on the piano-roll keyboard.
     preview: Option<u8>,
     /// Playing tick, if playing.
@@ -323,6 +352,7 @@ impl App {
             settings_open: false,
             draft: settings,
             devices: Vec::new(),
+            demos: demo_files(),
             preview: None,
             cur: None,
             samples: HashMap::new(),
@@ -559,6 +589,17 @@ impl App {
                 self.set_project(if demo { Project::demo() } else { Project::blank() }, None);
                 self.status = if demo { "New project from the demo song".into() } else { "New empty project".into() };
             }
+            Then::OpenDemo(i) => {
+                let Some(path) = self.demos.get(i).cloned() else { return };
+                match file::load(&path) {
+                    // Unsaved, so Save asks where: the demos may be in a read-only folder.
+                    Ok(p) => {
+                        self.set_project(p, None);
+                        self.status = format!("Opened the {} demo; save it to keep your changes", demo_name(&path));
+                    }
+                    Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
+                }
+            }
             Then::Open => {
                 let dir = self.dialog_dir();
                 self.file_dialog(move || Dialog::Open(rfd::FileDialog::new().set_title("Open project").add_filter("Ritmo project", &[file::EXTENSION]).set_directory(dir).pick_file()));
@@ -721,9 +762,16 @@ impl App {
             if item(ui, "New empty project", "Ctrl+N").clicked() {
                 self.request(&ctx, Then::New { demo: false });
             }
-            if item(ui, "New from demo song", "").clicked() {
-                self.request(&ctx, Then::New { demo: true });
-            }
+            ui.menu_button("Open a demo", |ui| {
+                if ui.button("Lo-fi loop (the startup song)").clicked() {
+                    self.request(&ctx, Then::New { demo: true });
+                }
+                for i in 0..self.demos.len() {
+                    if ui.button(demo_name(&self.demos[i])).clicked() {
+                        self.request(&ctx, Then::OpenDemo(i));
+                    }
+                }
+            });
             if item(ui, "Open…", "Ctrl+O").clicked() {
                 self.request(&ctx, Then::Open);
             }
@@ -1161,7 +1209,7 @@ impl App {
                 }
             });
             egui::CollapsingHeader::new("▦ Patterns").default_open(true).show(ui, |ui| {
-                if ui.small_button("＋ New pattern").on_hover_text("Add an empty one-bar pattern").clicked() {
+                if ui.small_button("+ New pattern").on_hover_text("Add an empty one-bar pattern").clicked() {
                     self.pattern = self.project.new_pattern();
                     self.open[Win::Rack as usize] = true;
                 }
@@ -1184,7 +1232,7 @@ impl App {
                     edit_menu(&resp, |ui| {
                         ui.label(RichText::new("Name").small().weak());
                         ui.text_edit_singleline(&mut self.project.patterns[i].name);
-                        if ui.button("⧉ Clone").clicked() {
+                        if ui.button("🗐 Clone").clicked() {
                             clone = Some(id);
                             ui.close();
                         }
@@ -1347,14 +1395,58 @@ impl eframe::App for App {
     }
 }
 
+/// The ID desktops match the window to its `.desktop` file and icon with.
+const APP_ID: &str = "io.github.jerichosiahaya.Ritmo";
+
+/// The app icon: an orange diamond on a dark rounded square, as in the toolbar.
+fn icon(size: u32) -> egui::IconData {
+    let n = size as f32;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    // Four samples per pixel for smooth edges.
+    let cover = |inside: &dyn Fn(f32, f32) -> bool, x: u32, y: u32| {
+        let offs = [0.25, 0.75];
+        offs.iter().flat_map(|&a| offs.iter().map(move |&b| (a, b))).filter(|&(a, b)| inside((x as f32 + a) / n, (y as f32 + b) / n)).count() as f32 / 4.0
+    };
+    let square = |u: f32, v: f32| {
+        let (r, d) = (0.2, |t: f32| (0.5 - t).abs() - (0.5 - 0.2));
+        let (dx, dy) = (d(u).max(0.0), d(v).max(0.0));
+        dx * dx + dy * dy <= r * r
+    };
+    let diamond = |u: f32, v: f32| (u - 0.5).abs() + (v - 0.5).abs() <= 0.3;
+    for y in 0..size {
+        for x in 0..size {
+            let (bg, fg) = (cover(&square, x, y), cover(&diamond, x, y));
+            let mix = |a: u8, b: u8| (a as f32 * (1.0 - fg) + b as f32 * fg) as u8;
+            rgba.extend([mix(BG_DEEP.r(), ACCENT.r()), mix(BG_DEEP.g(), ACCENT.g()), mix(BG_DEEP.b(), ACCENT.b()), (bg * 255.0) as u8]);
+        }
+    }
+    egui::IconData { rgba, width: size, height: size }
+}
+
 fn main() -> eframe::Result {
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-V") => {
+            println!("ritmo {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("--help" | "-h") => {
+            println!("Ritmo {}: a DAW for Linux with sample chopping built in.\n\nUsage: ritmo [song.ritmo]\n\nWith a project file, opens it; otherwise starts with the demo song.", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        _ => {}
+    }
     let settings = Settings::load();
     let (audio, status) = match start_audio(&settings) {
         Ok(a) => (Some(a), "Ready".to_string()),
         Err(e) => (None, format!("Audio unavailable ({e}); Export WAV still works.")),
     };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]).with_min_inner_size([900.0, 600.0]).with_title("Ritmo"),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([900.0, 600.0])
+            .with_title("Ritmo")
+            .with_app_id(APP_ID)
+            .with_icon(icon(128)),
         ..Default::default()
     };
     eframe::run_native(

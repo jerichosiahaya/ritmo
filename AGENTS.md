@@ -24,6 +24,8 @@ Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian
 - `src/rt.rs`: the real-time guard. In debug and test builds it counts heap use inside `rt::enter()`/`rt::exit()` (the audio callback); the status bar shows a warning if it ever happens.
 - `src/main.rs`: app state (`App`), the cpal audio stream, toolbar and File menu (new/open/save, the "Save changes?" prompt, autosave, system file dialogs via `rfd` on a background thread), browser panel, keyboard shortcuts.
 - `src/windows.rs`: the floating windows (Playlist, Channel Rack, Piano Roll, Sampler, Mixer). Playlist and piano-roll drags (`ClipDrag`, `NoteDrag`) change nothing until dropped: each frame the window applies the drag to a copy of the project and draws that, then applies it for real on release.
+- `src/demos.rs` (tests only): builds the demo projects in `demos/` and the break they chop (`cargo test -- --ignored write_demos`); `demos_open` checks the shipped files open, find their samples and play. Sample paths in a project are resolved relative to its file (`file::load`).
+- `packaging/`: desktop entry, AppStream metadata, MIME type and icon (app ID `io.github.jerichosiahaya.Ritmo`, also set on the window), `install.sh` (installs a release build with all of those and the demos; used by the AUR `PKGBUILD` and the AppImage), `appimage.sh` (builds the AppImage), `aur/PKGBUILD`.
 - `src/widgets.rs`: theme colors and custom widgets (knob, LED, step button, meter, LCD) and `edit_menu`, a right-click menu that stays open for text fields (rename).
 
 ## How data flows
@@ -43,8 +45,13 @@ Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian
 - **Chops:** pad `k` (from 0) is pitch `CHOP_BASE + k` (48, `Z`); at most `MAX_SLICES` (16) slices, end to end. Keep chop operations in `project.rs` with tests, like the other edits.
 - **Sequencer timing:** ticks, `PPQ` = 96 per quarter note (`STEP` = 24 is a 16th). Swing lengthens the first 16th of each 8th-note pair and shortens the second, keeping the pair's length (`tick_len`). A note at tick `t` starts when the engine reaches `t`; notes end at their `end` tick; wrapping at the loop end releases held notes.
 - **UI:** egui 0.37 / eframe 0.37 (`App::ui`, `egui::Panel`, `Ui::scope_id`). Use the colors in `widgets.rs` instead of new hard-coded ones. New controls need hover text, and custom widgets set `widget_info` for accessibility.
+- **Fonts:** only egui's bundled fonts are used (no system fonts), so the UI looks the same everywhere. A new symbol in the UI must exist in them; `Hack` is the last fallback for symbols.
 - **Original look:** the layout follows common pattern-DAW conventions; do not copy other products' logos, skins or branding.
 - Keep changes small and in the existing structure. Do not add dependencies for things a few lines can do.
+
+## Releasing
+
+Set the version in `Cargo.toml` (and `pkgver` in `packaging/aur/PKGBUILD`, a `<release>` in the metainfo), then push a tag `v<version>`. The release workflow tests, builds the AppImage on Ubuntu 22.04 and opens a draft GitHub release with it (notes from `docs/release-notes/v<version>.md` if present). Then run `updpkgsums` on the PKGBUILD and push it, with `makepkg --printsrcinfo > .SRCINFO`, to the AUR.
 
 ## Checking UI changes
 

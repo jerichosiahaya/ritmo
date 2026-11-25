@@ -1,0 +1,515 @@
+{
+  "format": "ritmo",
+  "version": 3,
+  "project": {
+    "bpm": 90.0,
+    "swing": 0.6,
+    "beats_per_bar": 4,
+    "master": {
+      "tone": 0.75,
+      "crush": 0.05,
+      "wobble": 0.15,
+      "vinyl": 0.25,
+      "reverb": 0.2,
+      "volume": 0.8
+    },
+    "channels": [
+      {
+        "id": 5,
+        "name": "Kick",
+        "instrument": "Kick",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 1
+      },
+      {
+        "id": 6,
+        "name": "Snare",
+        "instrument": "Snare",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 1
+      },
+      {
+        "id": 7,
+        "name": "Hat",
+        "instrument": "Hat",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 1
+      },
+      {
+        "id": 8,
+        "name": "Keys",
+        "instrument": "Rhodes",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 2
+      },
+      {
+        "id": 9,
+        "name": "Bass",
+        "instrument": "Bass",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 3
+      },
+      {
+        "id": 10,
+        "name": "Lead",
+        "instrument": "Rhodes",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 4
+      },
+      {
+        "id": 16,
+        "name": "Dusty Break",
+        "instrument": "Chop",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 15,
+        "chop": {
+          "path": "samples/dusty-break.wav",
+          "len": 235200,
+          "slices": [
+            {
+              "start": 0,
+              "end": 14700,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 14700,
+              "end": 29400,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 29400,
+              "end": 44100,
+              "pitch": -2.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 44100,
+              "end": 58800,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 58800,
+              "end": 73500,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 73500,
+              "end": 88200,
+              "pitch": 0.0,
+              "reverse": true,
+              "gain": 1.0
+            },
+            {
+              "start": 88200,
+              "end": 102900,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 102900,
+              "end": 117600,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 117600,
+              "end": 132300,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 132300,
+              "end": 147000,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 147000,
+              "end": 161700,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 161700,
+              "end": 176400,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 176400,
+              "end": 191100,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 191100,
+              "end": 205800,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 205800,
+              "end": 220500,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            },
+            {
+              "start": 220500,
+              "end": 235200,
+              "pitch": 0.0,
+              "reverse": false,
+              "gain": 1.0
+            }
+          ],
+          "one_shot": true,
+          "cut_itself": true
+        }
+      }
+    ],
+    "mixer": [
+      {
+        "id": 1,
+        "name": "Drums",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false
+      },
+      {
+        "id": 2,
+        "name": "Keys",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false
+      },
+      {
+        "id": 3,
+        "name": "Bass",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false
+      },
+      {
+        "id": 4,
+        "name": "Lead",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false
+      },
+      {
+        "id": 15,
+        "name": "Chops",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false
+      }
+    ],
+    "patterns": [
+      {
+        "id": 11,
+        "name": "Flip",
+        "len": 768,
+        "notes": [
+          {
+            "id": 17,
+            "channel": 16,
+            "pitch": 48,
+            "start": 0,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 18,
+            "channel": 16,
+            "pitch": 49,
+            "start": 48,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 19,
+            "channel": 16,
+            "pitch": 54,
+            "start": 96,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 20,
+            "channel": 16,
+            "pitch": 51,
+            "start": 144,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 21,
+            "channel": 16,
+            "pitch": 56,
+            "start": 192,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 22,
+            "channel": 16,
+            "pitch": 53,
+            "start": 240,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 23,
+            "channel": 16,
+            "pitch": 50,
+            "start": 288,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 24,
+            "channel": 16,
+            "pitch": 55,
+            "start": 336,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 25,
+            "channel": 16,
+            "pitch": 48,
+            "start": 384,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 26,
+            "channel": 16,
+            "pitch": 49,
+            "start": 432,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 27,
+            "channel": 16,
+            "pitch": 54,
+            "start": 480,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 28,
+            "channel": 16,
+            "pitch": 51,
+            "start": 528,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 29,
+            "channel": 16,
+            "pitch": 60,
+            "start": 576,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 30,
+            "channel": 16,
+            "pitch": 61,
+            "start": 624,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 31,
+            "channel": 16,
+            "pitch": 58,
+            "start": 672,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 32,
+            "channel": 16,
+            "pitch": 63,
+            "start": 720,
+            "len": 48,
+            "vel": 100
+          }
+        ]
+      },
+      {
+        "id": 33,
+        "name": "Drums",
+        "len": 384,
+        "notes": [
+          {
+            "id": 34,
+            "channel": 5,
+            "pitch": 60,
+            "start": 0,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 35,
+            "channel": 5,
+            "pitch": 60,
+            "start": 240,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 36,
+            "channel": 6,
+            "pitch": 60,
+            "start": 96,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 37,
+            "channel": 6,
+            "pitch": 60,
+            "start": 288,
+            "len": 24,
+            "vel": 100
+          }
+        ]
+      },
+      {
+        "id": 38,
+        "name": "Bass",
+        "len": 768,
+        "notes": [
+          {
+            "id": 39,
+            "channel": 9,
+            "pitch": 33,
+            "start": 0,
+            "len": 144,
+            "vel": 100
+          },
+          {
+            "id": 40,
+            "channel": 9,
+            "pitch": 33,
+            "start": 240,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 41,
+            "channel": 9,
+            "pitch": 40,
+            "start": 288,
+            "len": 96,
+            "vel": 100
+          },
+          {
+            "id": 42,
+            "channel": 9,
+            "pitch": 38,
+            "start": 384,
+            "len": 144,
+            "vel": 100
+          },
+          {
+            "id": 43,
+            "channel": 9,
+            "pitch": 38,
+            "start": 624,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 44,
+            "channel": 9,
+            "pitch": 36,
+            "start": 672,
+            "len": 96,
+            "vel": 100
+          }
+        ]
+      }
+    ],
+    "tracks": [
+      {
+        "id": 12,
+        "name": "Chops",
+        "mute": false
+      },
+      {
+        "id": 13,
+        "name": "Drums",
+        "mute": false
+      },
+      {
+        "id": 14,
+        "name": "Bass",
+        "mute": false
+      }
+    ],
+    "clips": [
+      {
+        "id": 45,
+        "track": 12,
+        "pattern": 11,
+        "start": 0,
+        "len": 3840,
+        "offset": 0
+      },
+      {
+        "id": 46,
+        "track": 13,
+        "pattern": 33,
+        "start": 768,
+        "len": 2304,
+        "offset": 0
+      },
+      {
+        "id": 47,
+        "track": 14,
+        "pattern": 38,
+        "start": 768,
+        "len": 2304,
+        "offset": 0
+      }
+    ],
+    "loop_range": null,
+    "next_id": 47
+  }
+}

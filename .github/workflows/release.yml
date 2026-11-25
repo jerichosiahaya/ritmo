@@ -1,0 +1,29 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds the AppImage and opens a draft GitHub release with it, to
+# review and publish by hand.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ALSA headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the tag matches Cargo.toml
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)" = "$GITHUB_REF_NAME"
+      - run: cargo test --locked --release
+      - run: packaging/appimage.sh
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$([ -f "docs/release-notes/$GITHUB_REF_NAME.md" ] && echo "--notes-file docs/release-notes/$GITHUB_REF_NAME.md" || echo "--generate-notes")
+          gh release create "$GITHUB_REF_NAME" Ritmo-*.AppImage --draft --title "Ritmo ${GITHUB_REF_NAME#v}" $notes

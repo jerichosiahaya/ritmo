@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ritmo
+GenericName=Digital Audio Workstation
+Comment=Make music with patterns, a piano roll, a mixer and a chop sampler
+Exec=ritmo %f
+Icon=io.github.jerichosiahaya.Ritmo
+Terminal=false
+Categories=AudioVideo;Audio;Midi;Sequencer;Music;
+Keywords=DAW;music;beat;sampler;chop;sequencer;pattern;lofi;
+MimeType=application/x-ritmo;
+StartupWMClass=io.github.jerichosiahaya.Ritmo

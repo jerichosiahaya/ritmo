@@ -101,8 +101,14 @@ fn migrate(doc: &mut Value, from: u64) -> Result<(), FileError> {
     Ok(())
 }
 
+/// Opens a project. Sample paths saved relative to it (as in the demo projects) are looked up
+/// next to it.
 pub fn load(path: &Path) -> Result<Project, FileError> {
-    from_str(&fs::read_to_string(path)?)
+    let mut p = from_str(&fs::read_to_string(path)?)?;
+    if let Some(dir) = path.parent() {
+        p.resolve_samples(dir);
+    }
+    Ok(p)
 }
 
 /// Writes next to `path` first, then renames over it.
@@ -245,6 +251,20 @@ mod tests {
         assert_eq!(names, ["song.ritmo"]);
         assert!(matches!(load(&dir.join("missing.ritmo")), Err(FileError::Io(_))));
         assert!(save(&dir.join("no-such-dir/x.ritmo"), &Project::demo()).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relative_sample_paths_are_found_next_to_the_project() {
+        let dir = temp_dir("relative");
+        let mut p = with_chops();
+        let abs = PathBuf::from("/srv/samples/keys.wav");
+        let other = p.add_chop_channel("Keys", abs.clone(), 1000).unwrap();
+        save(&dir.join("song.ritmo"), &p).unwrap();
+        let back = load(&dir.join("song.ritmo")).unwrap();
+        let path = |p: &Project, i: usize| p.channels.iter().filter_map(|c| c.chop.as_ref()).nth(i).unwrap().path.clone();
+        assert_eq!((path(&back, 0), path(&back, 1)), (dir.join("samples/break.wav"), abs));
+        assert!(back.chop(other).is_some());
         fs::remove_dir_all(dir).unwrap();
     }
 

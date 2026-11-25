@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.jerichosiahaya.Ritmo</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Ritmo</name>
+  <summary>A DAW with sample chopping built in</summary>
+  <developer id="io.github.jerichosiahaya">
+    <name>jerichosiahaya</name>
+  </developer>
+  <description>
+    <p>
+      Ritmo is a complete music app for Linux that runs on just a laptop. Build beats from
+      patterns, arrange them in a playlist, write melodies in the piano roll and mix them with
+      the built-in drums, electric piano and bass, through a lo-fi master chain.
+    </p>
+    <p>
+      Its chop sampler takes any audio file, chops it onto 16 pads at its hits, in even slices
+      or by tapping along, and lets you pitch, reverse and sequence the chops like any other
+      instrument.
+    </p>
+    <ul>
+      <li>Patterns, a free-form playlist with looping clips, and a loop range</li>
+      <li>Piano roll with note length, velocity, selection, copy and paste</li>
+      <li>Chop sampler for WAV, FLAC, MP3, OGG and AIFF files</li>
+      <li>Mixer with meters, metronome, undo and redo for every edit</li>
+      <li>Projects saved as readable files, with autosave; export to WAV</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.jerichosiahaya.Ritmo.desktop</launchable>
+  <url type="homepage">https://github.com/jerichosiahaya/ritmo</url>
+  <url type="bugtracker">https://github.com/jerichosiahaya/ritmo/issues</url>
+  <provides>
+    <binary>ritmo</binary>
+    <mediatype>application/x-ritmo</mediatype>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+  </categories>
+  <releases>
+    <release version="0.2.0" date="2027-01-31">
+      <description>
+        <p>First public release: projects and autosave, undo, the chop sampler, a free-form
+        playlist, piano-roll editing, metronome and audio settings.</p>
+      </description>
+    </release>
+  </releases>
+</component>

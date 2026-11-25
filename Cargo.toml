@@ -1,13 +1,23 @@
 [package]
 name = "ritmo"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "A DAW for Linux that runs on just a laptop, with sample chopping built in"
+license = "MIT"
+repository = "https://github.com/jerichosiahaya/ritmo"
 
 [dependencies]
 cpal = "0.18.2"
-eframe = "0.37.0"
+# eframe's defaults minus `system_fonts`: Ritmo draws only with egui's bundled fonts, including
+# its symbol and emoji fonts (the icons), so it looks the same everywhere. The system-font
+# fallback drew blank boxes for some icons and panics on a system without fonts.
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "links", "wayland", "wgpu", "x11"] }
+egui = { version = "0.37.0", default-features = false, features = ["monochrome_emoji_fonts"] }
 hound = "3.5.1"
 rfd = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 symphonia = { version = "0.6", features = ["mp3", "aiff"] }
+# What eframe's defaults turn on in winit: Wayland loaded at run time, and window decorations
+# on Wayland desktops that leave them to the app (GNOME).
+winit = { version = "0.30.13", default-features = false, features = ["wayland-dlopen", "wayland-csd-adwaita"] }

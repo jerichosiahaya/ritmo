@@ -953,6 +953,13 @@ impl Project {
 /// Chop sampler operations. A chop channel's slices sit end to end, so "chop points" (the slice
 /// starts) describe them; per-slice settings stay with the slice's position.
 impl Project {
+    /// Makes relative sample paths relative to `dir` (the project file's folder).
+    pub fn resolve_samples(&mut self, dir: &Path) {
+        for chop in self.channels.iter_mut().filter_map(|c| c.chop.as_mut()).filter(|c| c.path.is_relative()) {
+            chop.path = dir.join(&chop.path);
+        }
+    }
+
     /// The chop settings of a chop channel.
     pub fn chop(&self, channel: ChannelId) -> Option<&Chop> {
         self.channel(channel).and_then(|c| c.chop.as_ref())

@@ -76,7 +76,7 @@ fn rack(app: &mut App, ui: &mut Ui) {
             })
             .response
             .on_hover_text("Pattern whose steps the drum rows edit");
-        if ui.small_button("＋").on_hover_text("New empty pattern").clicked() {
+        if ui.small_button("+").on_hover_text("New empty pattern").clicked() {
             app.pattern = app.project.new_pattern();
         }
     });
@@ -656,7 +656,7 @@ fn bar_beat(t: Tick, bar: Tick) -> String {
 
 fn playlist_header(app: &mut App, ui: &mut Ui) {
     ui.horizontal(|ui| {
-        if ui.small_button("＋ Track").on_hover_text("Add an empty playlist track").clicked() {
+        if ui.small_button("+ Track").on_hover_text("Add an empty playlist track").clicked() {
             app.project.new_track();
         }
         ui.separator();
@@ -671,10 +671,10 @@ fn playlist_header(app: &mut App, ui: &mut Ui) {
             })
             .response
             .on_hover_text("What clips and the loop snap to while dragging. Hold Alt to place freely.");
-        if ui.small_button("－").on_hover_text("Zoom out (Ctrl+scroll)").clicked() {
+        if ui.small_button("−").on_hover_text("Zoom out (Ctrl+scroll)").clicked() {
             app.bar_w = (app.bar_w / 1.25).clamp(*BAR_W.start(), *BAR_W.end());
         }
-        if ui.small_button("＋").on_hover_text("Zoom in (Ctrl+scroll)").clicked() {
+        if ui.small_button("+").on_hover_text("Zoom in (Ctrl+scroll)").clicked() {
             app.bar_w = (app.bar_w * 1.25).clamp(*BAR_W.start(), *BAR_W.end());
         }
         ui.separator();
@@ -687,7 +687,7 @@ fn playlist_header(app: &mut App, ui: &mut Ui) {
                     _ => format!("⟲ Loop {} → {}", bar_beat(a, bl), bar_beat(b, bl)),
                 };
                 ui.label(RichText::new(text).color(ACCENT));
-                if ui.small_button("✕").on_hover_text("Clear the loop: play the whole song").clicked() {
+                if ui.small_button("×").on_hover_text("Clear the loop: play the whole song").clicked() {
                     app.project.loop_range = None;
                 }
             }

@@ -1,0 +1,806 @@
+{
+  "format": "ritmo",
+  "version": 3,
+  "project": {
+    "bpm": 122.0,
+    "swing": 0.5,
+    "beats_per_bar": 4,
+    "master": {
+      "tone": 0.95,
+      "crush": 0.0,
+      "wobble": 0.05,
+      "vinyl": 0.0,
+      "reverb": 0.25,
+      "volume": 0.8
+    },
+    "channels": [
+      {
+        "id": 5,
+        "name": "Kick",
+        "instrument": "Kick",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 1
+      },
+      {
+        "id": 6,
+        "name": "Snare",
+        "instrument": "Snare",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 1
+      },
+      {
+        "id": 7,
+        "name": "Hat",
+        "instrument": "Hat",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 1
+      },
+      {
+        "id": 8,
+        "name": "Keys",
+        "instrument": "Rhodes",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 2
+      },
+      {
+        "id": 9,
+        "name": "Bass",
+        "instrument": "Bass",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 3
+      },
+      {
+        "id": 10,
+        "name": "Lead",
+        "instrument": "Rhodes",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false,
+        "mixer": 4
+      }
+    ],
+    "mixer": [
+      {
+        "id": 1,
+        "name": "Drums",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false
+      },
+      {
+        "id": 2,
+        "name": "Keys",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false
+      },
+      {
+        "id": 3,
+        "name": "Bass",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false
+      },
+      {
+        "id": 4,
+        "name": "Lead",
+        "vol": 0.8,
+        "pan": 0.0,
+        "mute": false
+      }
+    ],
+    "patterns": [
+      {
+        "id": 11,
+        "name": "Kick",
+        "len": 384,
+        "notes": [
+          {
+            "id": 15,
+            "channel": 5,
+            "pitch": 60,
+            "start": 0,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 16,
+            "channel": 5,
+            "pitch": 60,
+            "start": 96,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 17,
+            "channel": 5,
+            "pitch": 60,
+            "start": 192,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 18,
+            "channel": 5,
+            "pitch": 60,
+            "start": 288,
+            "len": 24,
+            "vel": 100
+          }
+        ]
+      },
+      {
+        "id": 19,
+        "name": "Beat",
+        "len": 384,
+        "notes": [
+          {
+            "id": 20,
+            "channel": 5,
+            "pitch": 60,
+            "start": 0,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 21,
+            "channel": 5,
+            "pitch": 60,
+            "start": 96,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 22,
+            "channel": 5,
+            "pitch": 60,
+            "start": 192,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 23,
+            "channel": 5,
+            "pitch": 60,
+            "start": 288,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 24,
+            "channel": 6,
+            "pitch": 60,
+            "start": 96,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 25,
+            "channel": 6,
+            "pitch": 60,
+            "start": 288,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 26,
+            "channel": 7,
+            "pitch": 60,
+            "start": 48,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 27,
+            "channel": 7,
+            "pitch": 60,
+            "start": 144,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 28,
+            "channel": 7,
+            "pitch": 60,
+            "start": 240,
+            "len": 24,
+            "vel": 100
+          },
+          {
+            "id": 29,
+            "channel": 7,
+            "pitch": 60,
+            "start": 336,
+            "len": 24,
+            "vel": 100
+          }
+        ]
+      },
+      {
+        "id": 30,
+        "name": "Stabs",
+        "len": 1536,
+        "notes": [
+          {
+            "id": 32,
+            "channel": 8,
+            "pitch": 55,
+            "start": 72,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 33,
+            "channel": 8,
+            "pitch": 60,
+            "start": 72,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 34,
+            "channel": 8,
+            "pitch": 64,
+            "start": 72,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 35,
+            "channel": 8,
+            "pitch": 71,
+            "start": 72,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 36,
+            "channel": 8,
+            "pitch": 55,
+            "start": 240,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 37,
+            "channel": 8,
+            "pitch": 60,
+            "start": 240,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 38,
+            "channel": 8,
+            "pitch": 64,
+            "start": 240,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 39,
+            "channel": 8,
+            "pitch": 71,
+            "start": 240,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 44,
+            "channel": 8,
+            "pitch": 53,
+            "start": 456,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 45,
+            "channel": 8,
+            "pitch": 57,
+            "start": 456,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 46,
+            "channel": 8,
+            "pitch": 60,
+            "start": 456,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 47,
+            "channel": 8,
+            "pitch": 64,
+            "start": 456,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 48,
+            "channel": 8,
+            "pitch": 53,
+            "start": 624,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 49,
+            "channel": 8,
+            "pitch": 57,
+            "start": 624,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 50,
+            "channel": 8,
+            "pitch": 60,
+            "start": 624,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 51,
+            "channel": 8,
+            "pitch": 64,
+            "start": 624,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 56,
+            "channel": 8,
+            "pitch": 52,
+            "start": 840,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 57,
+            "channel": 8,
+            "pitch": 55,
+            "start": 840,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 58,
+            "channel": 8,
+            "pitch": 59,
+            "start": 840,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 59,
+            "channel": 8,
+            "pitch": 62,
+            "start": 840,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 60,
+            "channel": 8,
+            "pitch": 52,
+            "start": 1008,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 61,
+            "channel": 8,
+            "pitch": 55,
+            "start": 1008,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 62,
+            "channel": 8,
+            "pitch": 59,
+            "start": 1008,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 63,
+            "channel": 8,
+            "pitch": 62,
+            "start": 1008,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 68,
+            "channel": 8,
+            "pitch": 53,
+            "start": 1224,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 69,
+            "channel": 8,
+            "pitch": 59,
+            "start": 1224,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 70,
+            "channel": 8,
+            "pitch": 64,
+            "start": 1224,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 71,
+            "channel": 8,
+            "pitch": 69,
+            "start": 1224,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 72,
+            "channel": 8,
+            "pitch": 53,
+            "start": 1392,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 73,
+            "channel": 8,
+            "pitch": 59,
+            "start": 1392,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 74,
+            "channel": 8,
+            "pitch": 64,
+            "start": 1392,
+            "len": 48,
+            "vel": 90
+          },
+          {
+            "id": 75,
+            "channel": 8,
+            "pitch": 69,
+            "start": 1392,
+            "len": 48,
+            "vel": 90
+          }
+        ]
+      },
+      {
+        "id": 31,
+        "name": "Bass",
+        "len": 1536,
+        "notes": [
+          {
+            "id": 40,
+            "channel": 9,
+            "pitch": 45,
+            "start": 48,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 41,
+            "channel": 9,
+            "pitch": 45,
+            "start": 144,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 42,
+            "channel": 9,
+            "pitch": 45,
+            "start": 240,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 43,
+            "channel": 9,
+            "pitch": 45,
+            "start": 336,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 52,
+            "channel": 9,
+            "pitch": 41,
+            "start": 432,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 53,
+            "channel": 9,
+            "pitch": 41,
+            "start": 528,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 54,
+            "channel": 9,
+            "pitch": 41,
+            "start": 624,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 55,
+            "channel": 9,
+            "pitch": 41,
+            "start": 720,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 64,
+            "channel": 9,
+            "pitch": 36,
+            "start": 816,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 65,
+            "channel": 9,
+            "pitch": 36,
+            "start": 912,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 66,
+            "channel": 9,
+            "pitch": 36,
+            "start": 1008,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 67,
+            "channel": 9,
+            "pitch": 36,
+            "start": 1104,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 76,
+            "channel": 9,
+            "pitch": 43,
+            "start": 1200,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 77,
+            "channel": 9,
+            "pitch": 43,
+            "start": 1296,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 78,
+            "channel": 9,
+            "pitch": 43,
+            "start": 1392,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 79,
+            "channel": 9,
+            "pitch": 43,
+            "start": 1488,
+            "len": 48,
+            "vel": 100
+          }
+        ]
+      },
+      {
+        "id": 80,
+        "name": "Lead",
+        "len": 1536,
+        "notes": [
+          {
+            "id": 81,
+            "channel": 10,
+            "pitch": 76,
+            "start": 0,
+            "len": 96,
+            "vel": 100
+          },
+          {
+            "id": 82,
+            "channel": 10,
+            "pitch": 74,
+            "start": 144,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 83,
+            "channel": 10,
+            "pitch": 72,
+            "start": 192,
+            "len": 144,
+            "vel": 100
+          },
+          {
+            "id": 84,
+            "channel": 10,
+            "pitch": 72,
+            "start": 384,
+            "len": 96,
+            "vel": 100
+          },
+          {
+            "id": 85,
+            "channel": 10,
+            "pitch": 69,
+            "start": 528,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 86,
+            "channel": 10,
+            "pitch": 72,
+            "start": 576,
+            "len": 192,
+            "vel": 100
+          },
+          {
+            "id": 87,
+            "channel": 10,
+            "pitch": 76,
+            "start": 768,
+            "len": 96,
+            "vel": 100
+          },
+          {
+            "id": 88,
+            "channel": 10,
+            "pitch": 79,
+            "start": 912,
+            "len": 48,
+            "vel": 100
+          },
+          {
+            "id": 89,
+            "channel": 10,
+            "pitch": 76,
+            "start": 960,
+            "len": 144,
+            "vel": 100
+          },
+          {
+            "id": 90,
+            "channel": 10,
+            "pitch": 74,
+            "start": 1152,
+            "len": 144,
+            "vel": 100
+          },
+          {
+            "id": 91,
+            "channel": 10,
+            "pitch": 71,
+            "start": 1344,
+            "len": 192,
+            "vel": 100
+          }
+        ]
+      }
+    ],
+    "tracks": [
+      {
+        "id": 12,
+        "name": "Drums",
+        "mute": false
+      },
+      {
+        "id": 13,
+        "name": "Keys",
+        "mute": false
+      },
+      {
+        "id": 14,
+        "name": "Bass",
+        "mute": false
+      },
+      {
+        "id": 92,
+        "name": "Lead",
+        "mute": false
+      }
+    ],
+    "clips": [
+      {
+        "id": 93,
+        "track": 12,
+        "pattern": 11,
+        "start": 0,
+        "len": 1536,
+        "offset": 0
+      },
+      {
+        "id": 94,
+        "track": 12,
+        "pattern": 19,
+        "start": 1536,
+        "len": 1536,
+        "offset": 0
+      },
+      {
+        "id": 95,
+        "track": 12,
+        "pattern": 19,
+        "start": 4608,
+        "len": 4608,
+        "offset": 0
+      },
+      {
+        "id": 96,
+        "track": 13,
+        "pattern": 30,
+        "start": 1536,
+        "len": 7680,
+        "offset": 0
+      },
+      {
+        "id": 97,
+        "track": 14,
+        "pattern": 31,
+        "start": 1536,
+        "len": 1536,
+        "offset": 0
+      },
+      {
+        "id": 98,
+        "track": 14,
+        "pattern": 31,
+        "start": 4608,
+        "len": 4608,
+        "offset": 0
+      },
+      {
+        "id": 99,
+        "track": 92,
+        "pattern": 80,
+        "start": 4608,
+        "len": 3072,
+        "offset": 0
+      }
+    ],
+    "loop_range": null,
+    "next_id": 99
+  }
+}
