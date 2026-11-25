@@ -16,7 +16,7 @@ const FORMAT: &str = "ritmo";
 /// File format version this build writes. When a saved field changes shape or meaning: bump it,
 /// add an upgrade step to `migrate`, and run `cargo test -- --ignored write_fixture` to add a
 /// fixture under `tests/files/` that every later version must keep opening.
-pub const VERSION: u64 = 2;
+pub const VERSION: u64 = 3;
 
 #[derive(Debug)]
 pub enum FileError {
@@ -75,9 +75,28 @@ pub fn from_str(text: &str) -> Result<Project, FileError> {
 ///
 /// - 1 → 2: channels gained optional chop settings (`chop`); version 1 files have none, so
 ///   nothing needs rewriting.
-fn migrate(_doc: &mut Value, from: u64) -> Result<(), FileError> {
+/// - 2 → 3: a clip longer than the rest of its pattern repeats the pattern; before, it went
+///   silent there. Older clips are cut where they went silent, so they sound the same, and
+///   clips that started past their pattern's end (silent throughout) are dropped.
+fn migrate(doc: &mut Value, from: u64) -> Result<(), FileError> {
     if from < 1 {
         return Err(FileError::Broken(format!("unknown file format {from}")));
+    }
+    if from < 3 {
+        let project = &mut doc["project"];
+        let num = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64);
+        let lens: Vec<(u64, u64)> = project["patterns"].as_array().into_iter().flatten().filter_map(|p| Some((num(p, "id")?, num(p, "len")?))).collect();
+        if let Some(clips) = project.get_mut("clips").and_then(Value::as_array_mut) {
+            clips.retain_mut(|c| {
+                let pattern_len = num(c, "pattern").and_then(|id| lens.iter().find(|&&(p, _)| p == id)).map(|&(_, len)| len);
+                let (Some(pattern_len), Some(offset), Some(len)) = (pattern_len, num(c, "offset"), num(c, "len")) else { return true };
+                if offset >= pattern_len {
+                    return false;
+                }
+                c["len"] = len.min(pattern_len - offset).into();
+                true
+            });
+        }
     }
     Ok(())
 }
@@ -133,9 +152,12 @@ pub fn autosave(p: &Project) -> Result<PathBuf, FileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::{CHOP_BASE, ChannelId, PatternId, STEP};
+    use crate::project::{CHOP_BASE, ChannelId, PPQ, PatternId, STEP};
 
-    /// The demo plus a chop channel (its audio file need not exist) playing pad 2.
+    const BAR: crate::project::Tick = 4 * PPQ;
+
+    /// The demo plus a chop channel (its audio file need not exist) playing pad 2, and (from
+    /// format 3) a clip that repeats its one-bar pattern for four bars from its second beat.
     fn with_chops() -> Project {
         let mut p = Project::demo();
         let ch = p.add_chop_channel("Break", PathBuf::from("samples/break.wav"), 88200).unwrap();
@@ -144,8 +166,13 @@ mod tests {
         p.slice_mut(ch, 2).unwrap().reverse = true;
         let beat = p.patterns[0].id;
         p.add_note(beat, ch, CHOP_BASE + 1, 0, STEP, 100);
+        let long = p.add_track("Long");
+        p.add_clip_at(long, beat, 4 * BAR + PPQ, 4 * BAR, PPQ);
         p
     }
+
+    /// Fixture names after the format number: what that format added.
+    const FIXTURE: &str = "loops";
 
     fn fixtures() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/files")
@@ -251,14 +278,37 @@ mod tests {
         assert_eq!((chop.slices.len(), chop.slices[1].pitch, chop.slices[2].reverse), (4, 3.0, true));
         // Files without chops don't mention them.
         assert!(!to_string(&Project::demo()).contains("chop"));
+        // Format 3: clips repeat their pattern.
+        let v3 = load(&fixtures().join("format-3-loops.ritmo")).unwrap();
+        let long = v3.clips.iter().find(|c| c.len == 4 * BAR && c.offset == PPQ).unwrap();
+        // The one-bar drum pattern has 3 kicks, 2 snares, 8 hats and the chop pad: 14 notes.
+        // Four bars from beat 2 play each once per bar, beat 1's last.
+        let starts: Vec<_> = v3.clip_notes(*long).map(|(t, _)| t).collect();
+        assert_eq!((starts.len(), starts.iter().filter(|&&t| t >= 4 * BAR - PPQ).count()), (4 * 14, 4));
+    }
+
+    /// Format 2 clips went silent past their pattern's end; opened now, they are cut there.
+    #[test]
+    fn format_2_clips_are_cut_where_they_went_silent() {
+        let mut doc: Value = serde_json::from_str(&to_string(&Project::demo())).unwrap();
+        doc["version"] = 2.into();
+        // The second drum clip (one-bar pattern) made 3 bars long from beat 2; the third starts
+        // past the pattern's end.
+        doc["project"]["clips"][2]["len"] = (3 * BAR).into();
+        doc["project"]["clips"][2]["offset"] = PPQ.into();
+        doc["project"]["clips"][3]["offset"] = BAR.into();
+        let p = from_str(&doc.to_string()).unwrap();
+        assert_eq!(p.clips.len(), Project::demo().clips.len() - 1);
+        assert_eq!((p.clips[2].len, p.clips[2].offset), (BAR - PPQ, PPQ));
     }
 
     /// Writes the fixture for the current format version. Run after bumping `VERSION`.
     #[test]
-    #[ignore = "writes tests/files/format-<VERSION>-chops.ritmo"]
+    #[ignore = "writes tests/files/format-<VERSION>-<FIXTURE>.ritmo"]
     fn write_fixture() {
-        // Version 1's fixture is format-1-demo.ritmo (the demo song alone).
-        let path = fixtures().join(format!("format-{VERSION}-chops.{EXTENSION}"));
+        // Version 1's fixture is format-1-demo.ritmo (the demo song alone), version 2's
+        // format-2-chops.ritmo.
+        let path = fixtures().join(format!("format-{VERSION}-{FIXTURE}.{EXTENSION}"));
         fs::create_dir_all(fixtures()).unwrap();
         save(&path, &with_chops()).unwrap();
     }

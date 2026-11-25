@@ -12,7 +12,7 @@ use eframe::egui::{self, Color32, Key, RichText};
 use engine::{Cmd, Engine, Instrument, METERS, SampleData, Snapshot, STEP};
 use std::collections::HashMap;
 use history::History;
-use project::{CHOP_BASE, CHORDS, ChannelId, MAX_SLICES, PatternId, Project, Tick, TrackId};
+use project::{CHOP_BASE, CHORDS, ChannelId, ClipId, MAX_SLICES, PatternId, Project, Tick, TrackId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -174,6 +174,12 @@ struct App {
     /// Playlist selection; a chord clicked in the browser is stamped there.
     sel_track: Option<TrackId>,
     sel_bar: Tick,
+    /// Selected playlist clips, a playlist drag in progress, what drags snap to, and the zoom
+    /// (pixels per bar).
+    sel_clips: Vec<ClipId>,
+    clip_drag: Option<windows::ClipDrag>,
+    grid: windows::Snap,
+    bar_w: f32,
     /// Pattern the Channel Rack's step grid edits.
     pattern: PatternId,
     /// Pattern and channel the Piano Roll edits, and its lowest visible key.
@@ -249,6 +255,10 @@ impl App {
             open: [true, true, false, false, false],
             meters: [0.0; METERS],
             sel_bar: 0,
+            sel_clips: Vec::new(),
+            clip_drag: None,
+            grid: windows::Snap::Bar,
+            bar_w: 140.0,
             pattern: PatternId(0),
             roll: (PatternId(0), ChannelId(0)),
             roll_low: 60,
@@ -282,6 +292,7 @@ impl App {
         let roll_pat = project.patterns.iter().find(|p| p.notes.iter().any(|n| n.channel == roll_ch)).map_or(pattern, |p| p.id);
         self.sel_track = project.tracks.first().map(|t| t.id);
         self.sel_bar = 0;
+        (self.sel_clips, self.clip_drag) = (Vec::new(), None);
         self.chop_ch = project.channels.iter().find(|c| c.chop.is_some()).map(|c| c.id);
         (self.chop_sel, self.chop_drag) = (0, None);
         self.tap = None;
@@ -458,6 +469,8 @@ impl App {
         if self.sel_track.is_some_and(|t| p.track(t).is_none()) {
             self.sel_track = p.tracks.first().map(|t| t.id);
         }
+        self.sel_clips.retain(|&id| p.clips.iter().any(|c| c.id == id));
+        self.clip_drag = None;
         if self.tap.as_ref().is_some_and(|t| p.chop(t.channel).is_none()) {
             self.tap = None;
         }
@@ -730,13 +743,15 @@ impl App {
             self.status = "Pick a bar that has a clip to put the chord in.".into();
             return;
         };
-        if !self.project.stamp_chord(c.pattern, bar * bl - c.start + c.offset, bl, j) {
+        if !self.project.stamp_chord(c.pattern, self.project.clip_pos(&c, bar * bl - c.start), bl, j) {
             self.status = "Chords need an electric-piano channel in the Channel Rack.".into();
         }
     }
 
+    /// Exports the whole song, whatever the loop range.
     fn export(&mut self) {
-        let snap = self.compile();
+        let mut snap = self.compile();
+        (snap.loop_start, snap.loop_end) = self.project.song_range();
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let dir = Path::new(&home).join("Music");
         let dir = if dir.is_dir() { dir } else { PathBuf::from(".") };
@@ -766,6 +781,14 @@ impl App {
             }
             if self.tap.is_some() && pressed && (key == Key::Enter || key == Key::Escape) {
                 if key == Key::Enter { self.tap() } else { self.finish_tap() }
+            } else if pressed && matches!(key, Key::Delete | Key::Backspace) && !self.sel_clips.is_empty() {
+                self.project.remove_clips(&self.sel_clips);
+                self.sel_clips.clear();
+            } else if pressed && key == Key::Escape {
+                // Cancels a playlist drag, else clears the clip selection.
+                if self.clip_drag.take().is_none() {
+                    self.sel_clips.clear();
+                }
             } else if let Some(&(w, _, _)) = WINDOWS.iter().find(|(_, _, k)| *k == key) {
                 if pressed {
                     self.open[w as usize] ^= true;

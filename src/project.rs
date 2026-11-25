@@ -147,8 +147,8 @@ pub struct Track {
     pub mute: bool,
 }
 
-/// Plays pattern ticks `offset .. offset + len` from `start` on the playlist.
-/// Past the pattern's end the clip is silent (no looping).
+/// Plays its pattern on the playlist from `start` for `len` ticks, beginning at pattern tick
+/// `offset` and repeating the pattern for as long as the clip lasts.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Clip {
     pub id: ClipId,
@@ -216,6 +216,12 @@ impl Project {
     /// End of the last clip: the song's length.
     pub fn end(&self) -> Tick {
         self.clips.iter().map(Clip::end).max().unwrap_or(0)
+    }
+
+    /// The whole song, rounded up to whole bars (at least one).
+    pub fn song_range(&self) -> (Tick, Tick) {
+        let bar = self.bar_len();
+        (0, self.end().div_ceil(bar).max(1) * bar)
     }
 
     /// None if the mixer already has `MAX_MIXER` tracks.
@@ -332,8 +338,8 @@ impl Project {
     }
 
     /// Builds what the engine plays: indices instead of IDs, volume and pan as gains, and every
-    /// clip's notes placed in song time, sorted by start. Notes starting outside a clip's part of
-    /// the pattern are skipped; notes running past the clip's end are cut there. Without a loop
+    /// clip's notes placed in song time (`clip_notes`), sorted by start. Notes running past a
+    /// clip's end are cut there. Without a loop
     /// range, playback loops the song rounded up to whole bars.
     #[cfg(test)]
     pub fn compile(&self) -> Snapshot {
@@ -369,20 +375,18 @@ impl Project {
 
         let mut notes = Vec::new();
         for clip in &self.clips {
-            let (Some(track), Some(pattern)) = (self.track(clip.track), self.pattern(clip.pattern)) else { continue };
-            if track.mute {
+            if self.track(clip.track).is_none_or(|t| t.mute) {
                 continue;
             }
-            for n in pattern.notes.iter().filter(|n| (clip.offset..clip.offset + clip.len).contains(&n.start)) {
+            for (t, n) in self.clip_notes(*clip) {
                 let Some(channel) = index(n.channel) else { continue };
-                let start = clip.start + n.start - clip.offset;
+                let start = clip.start + t;
                 notes.push(SeqNote { start, end: (start + n.len).min(clip.end()), channel: channel as u16, pitch: n.pitch, vel: n.vel });
             }
         }
         notes.sort_by_key(|n| (n.start, n.channel, n.pitch));
 
-        let bar = self.bar_len();
-        let (loop_start, loop_end) = self.loop_range.unwrap_or((0, self.end().div_ceil(bar).max(1) * bar));
+        let (loop_start, loop_end) = self.loop_range.unwrap_or(self.song_range());
         Snapshot { bpm: self.bpm, swing: self.swing, fx: self.master, channels, mixer, notes, chops, loop_start, loop_end }
     }
 
@@ -542,17 +546,20 @@ impl Project {
     }
 
     /// Index into `CHORDS` of the chord the electric-piano notes starting at `start` spell, or 0.
+    /// Chords voiced alike (Dm9 and Fmaj7) are told apart by the bass note.
     pub fn chord_at(&self, pattern: PatternId, start: Tick) -> usize {
         let Some(p) = self.pattern(pattern) else { return 0 };
-        let piano = |c: ChannelId| self.channel(c).is_some_and(|c| c.instrument == Instrument::Rhodes);
-        let mut got: Vec<u8> = p.notes.iter().filter(|n| n.start == start && piano(n.channel)).map(|n| n.pitch).collect();
+        let plays = |c: ChannelId, i: Instrument| self.channel(c).is_some_and(|c| c.instrument == i);
+        let mut got: Vec<u8> = p.notes.iter().filter(|n| n.start == start && plays(n.channel, Instrument::Rhodes)).map(|n| n.pitch).collect();
         got.sort_unstable();
-        CHORDS.iter().position(|c| {
+        let bass = p.notes.iter().find(|n| n.start == start && plays(n.channel, Instrument::Bass)).map(|n| n.pitch);
+        let voiced = |c: &Chord| {
             let mut want = c.notes.to_vec();
             want.sort_unstable();
             !want.is_empty() && want == got
-        })
-        .unwrap_or(0)
+        };
+        let exact = CHORDS.iter().position(|c| voiced(c) && bass == Some(c.bass));
+        exact.or_else(|| CHORDS.iter().position(voiced)).unwrap_or(0)
     }
 
     /// The clip on `track` that plays at `tick`.
@@ -563,7 +570,7 @@ impl Project {
     /// Where `pattern` is playing at song time `tick`, through any clip on an unmuted track.
     pub fn pattern_pos(&self, pattern: PatternId, tick: Tick) -> Option<Tick> {
         let playing = |c: &&Clip| c.pattern == pattern && c.start <= tick && tick < c.end() && self.track(c.track).is_some_and(|t| !t.mute);
-        self.clips.iter().find(playing).map(|c| tick - c.start + c.offset)
+        self.clips.iter().find(playing).map(|c| self.clip_pos(c, tick - c.start))
     }
 
     /// Playlist click on bar `bar` of `track`: if clips cover it, cuts that bar out of them;
@@ -572,17 +579,8 @@ impl Project {
     pub fn toggle_bar(&mut self, track: TrackId, bar: Tick, fallback: PatternId) {
         let bl = self.bar_len();
         let (a, b) = (bar * bl, bar * bl + bl);
-        let hit: Vec<Clip> = self.clips.iter().filter(|c| c.track == track && c.start < b && a < c.end()).copied().collect();
-        if !hit.is_empty() {
-            for c in hit {
-                self.remove_clip(c.id);
-                if c.start < a {
-                    self.add_clip_at(track, c.pattern, c.start, a - c.start, c.offset);
-                }
-                if b < c.end() {
-                    self.add_clip_at(track, c.pattern, b, c.end() - b, c.offset + (b - c.start));
-                }
-            }
+        if self.clips.iter().any(|c| c.track == track && c.start < b && a < c.end()) {
+            self.clear_range(track, a, b, &[]);
             return;
         }
         let nearest = self.clips.iter().filter(|c| c.track == track).min_by_key(|c| if c.end() <= a { a - c.end() } else { c.start - b });
@@ -597,7 +595,8 @@ impl Project {
     fn join_clips(&mut self, track: TrackId) {
         loop {
             let on_track = || self.clips.iter().filter(|c| c.track == track);
-            let pair = on_track().find_map(|x| on_track().find(|y| y.pattern == x.pattern && x.end() == y.start && x.offset + x.len == y.offset).map(|y| (x.id, *y)));
+            let continues = |x: &Clip, y: &Clip| y.pattern == x.pattern && x.end() == y.start && self.clip_pos(x, x.len) == self.clip_pos(y, 0);
+            let pair = on_track().find_map(|x| on_track().find(|y| continues(x, y)).map(|y| (x.id, *y)));
             let Some((keep, next)) = pair else { return };
             self.remove_clip(next.id);
             if let Some(c) = self.clips.iter_mut().find(|c| c.id == keep) {
@@ -655,6 +654,140 @@ impl Project {
         p.add_clip(t_melody, melody, 0, 4 * bar);
         p
     }
+}
+
+/// The playlist: where clips play, and editing them freely. On one track, clips put where others
+/// are cut those away, so clips on a track never overlap after an edit.
+impl Project {
+    /// The last tick a clip may reach.
+    pub fn max_end(&self) -> Tick {
+        MAX_BARS * self.bar_len()
+    }
+
+    /// Pattern tick that clip `c` plays `t` ticks after its start.
+    pub fn clip_pos(&self, c: &Clip, t: Tick) -> Tick {
+        let len = self.pattern(c.pattern).map_or(0, |p| p.len);
+        if len == 0 { 0 } else { (c.offset + t) % len }
+    }
+
+    /// The notes clip `c` plays, each with its start in ticks after the clip's start: the
+    /// pattern from `offset`, repeating until the clip ends. Notes the clip starts in the middle
+    /// of are skipped.
+    pub fn clip_notes(&self, c: Clip) -> impl Iterator<Item = (Tick, &Note)> {
+        let pattern = self.pattern(c.pattern).filter(|p| p.len > 0);
+        pattern.into_iter().flat_map(move |p| {
+            let off = c.offset % p.len;
+            (0..(off + c.len).div_ceil(p.len)).flat_map(move |pass| {
+                p.notes.iter().filter_map(move |n| {
+                    let t = pass * p.len + n.start;
+                    (off <= t && t < off + c.len).then(|| (t - off, n))
+                })
+            })
+        })
+    }
+
+    /// Whether clip `c` plays pattern tick `t` at least once.
+    pub fn clip_plays(&self, c: &Clip, t: Tick) -> bool {
+        let len = self.pattern(c.pattern).map_or(0, |p| p.len);
+        len > 0 && (c.len >= len || (t + len - c.offset % len) % len < c.len)
+    }
+
+    /// Cuts `a..b` out of the clips on `track` other than `keep`; the parts outside it stay.
+    fn clear_range(&mut self, track: TrackId, a: Tick, b: Tick, keep: &[ClipId]) {
+        let hit: Vec<Clip> = self.clips.iter().filter(|c| c.track == track && c.start < b && a < c.end() && !keep.contains(&c.id)).copied().collect();
+        for c in hit {
+            self.remove_clip(c.id);
+            if c.start < a {
+                self.add_clip_at(track, c.pattern, c.start, a - c.start, c.offset);
+            }
+            if b < c.end() {
+                let offset = self.clip_pos(&c, b - c.start);
+                self.add_clip_at(track, c.pattern, b, c.end() - b, offset);
+            }
+        }
+    }
+
+    /// Places all of `pattern` on `track` at `start` (cut at the song limit).
+    pub fn place_clip(&mut self, track: TrackId, pattern: PatternId, start: Tick) -> Option<ClipId> {
+        let len = self.pattern(pattern)?.len.max(1).min(self.max_end().checked_sub(start)?);
+        self.clear_range(track, start, start + len, &[]);
+        self.add_clip(track, pattern, start, len)
+    }
+
+    /// Limits a shift of `clips` by `dt` ticks and `rows` tracks down so every clip stays on a
+    /// track and inside the song.
+    pub fn clamp_shift(&self, clips: &[ClipId], dt: i64, rows: i64) -> (i64, i64) {
+        let picked = || self.clips.iter().filter(|c| clips.contains(&c.id));
+        let row = |c: &Clip| self.tracks.iter().position(|t| t.id == c.track).unwrap_or(0) as i64;
+        let (Some(first), Some(last)) = (picked().map(|c| c.start).min(), picked().map(Clip::end).max()) else { return (0, 0) };
+        let (top, bottom) = (picked().map(row).min().unwrap_or(0), picked().map(row).max().unwrap_or(0));
+        let dt = dt.clamp(-i64::from(first), i64::from(self.max_end()) - i64::from(last));
+        let rows = rows.clamp(-top, self.tracks.len() as i64 - 1 - bottom);
+        (dt, rows)
+    }
+
+    /// Moves `clips` by `dt` ticks and `rows` tracks down (limited by `clamp_shift`), or leaves
+    /// them and puts copies there. Returns the moved clips or the copies.
+    pub fn shift_clips(&mut self, clips: &[ClipId], dt: i64, rows: i64, copy: bool) -> Vec<ClipId> {
+        let (dt, rows) = self.clamp_shift(clips, dt, rows);
+        let moving: Vec<Clip> = self.clips.iter().filter(|c| clips.contains(&c.id)).copied().collect();
+        if !copy {
+            self.clips.retain(|c| !clips.contains(&c.id));
+        }
+        let landed: Vec<Clip> = moving
+            .iter()
+            .map(|c| {
+                let row = self.tracks.iter().position(|t| t.id == c.track).unwrap_or(0) as i64 + rows;
+                let id = if copy { ClipId(self.fresh_id()) } else { c.id };
+                Clip { id, track: self.tracks[row as usize].id, start: (i64::from(c.start) + dt) as Tick, ..*c }
+            })
+            .collect();
+        for c in &landed {
+            self.clear_range(c.track, c.start, c.end(), &[]);
+        }
+        self.clips.extend(&landed);
+        landed.iter().map(|c| c.id).collect()
+    }
+
+    /// Drags one edge of a clip to song tick `to`, keeping it at least `min` ticks long. Moving
+    /// the start keeps the notes where they are in the song; past either end of the pattern, the
+    /// pattern repeats.
+    pub fn resize_clip(&mut self, id: ClipId, edge: Edge, to: Tick, min: Tick) -> bool {
+        let Some(c) = self.clips.iter().find(|c| c.id == id).copied() else { return false };
+        let min = min.clamp(1, c.end());
+        let resized = match edge {
+            Edge::End => Clip { len: to.clamp(c.start + min, self.max_end().max(c.end())) - c.start, ..c },
+            Edge::Start => {
+                let start = to.min(c.end() - min);
+                let plen = i64::from(self.pattern(c.pattern).map_or(1, |p| p.len.max(1)));
+                let offset = (i64::from(c.offset) + i64::from(start) - i64::from(c.start)).rem_euclid(plen) as Tick;
+                Clip { start, len: c.end() - start, offset, ..c }
+            }
+        };
+        self.clear_range(c.track, resized.start, resized.end(), &[id]);
+        if let Some(x) = self.clips.iter_mut().find(|x| x.id == id) {
+            *x = resized;
+        }
+        true
+    }
+
+    pub fn remove_clips(&mut self, clips: &[ClipId]) {
+        self.clips.retain(|c| !clips.contains(&c.id));
+    }
+
+    /// Loops playback over `a..b` (either order, cut at the song limit), or clears the loop if
+    /// that is empty.
+    pub fn set_loop(&mut self, a: Tick, b: Tick) {
+        let (a, b) = (a.min(b), a.max(b).min(self.max_end()));
+        self.loop_range = (a < b).then_some((a, b));
+    }
+}
+
+/// Which edge of a clip a resize drags.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Edge {
+    Start,
+    End,
 }
 
 /// Managing patterns and tracks.
@@ -1038,6 +1171,9 @@ mod tests {
         assert!(!named(&p, "Chords").notes.iter().any(|n| (BAR..2 * BAR).contains(&n.start)));
         assert_eq!((p.chord_at(chords, 0), p.chord_at(chords, 2 * BAR)), (1, 3));
         assert_eq!(p.pattern(melody).unwrap().notes, melody_before);
+        // Fmaj7 is voiced like Dm9; the bass tells them apart.
+        assert!(p.stamp_chord(chords, BAR, BAR, 5));
+        assert_eq!((p.chord_at(chords, BAR), p.chord_at(chords, 0)), (5, 1));
         p.validate().unwrap();
 
         let (mut q, _, pat, ..) = tiny(); // drums only: nowhere to put a chord
@@ -1054,10 +1190,11 @@ mod tests {
         // Putting it back takes bar 2 of the melody and joins all three again.
         p.toggle_bar(melody, 1, beat);
         assert_eq!(clips_on(&p, melody), [(0, 4 * BAR, 0)]);
-        // One-bar drum clips repeat the pattern; they are not joined.
+        // One-bar drum clips continue each other (clips repeat their pattern): they join too.
         p.toggle_bar(drums, 0, beat);
+        assert_eq!(clips_on(&p, drums), [(BAR, BAR, 0), (2 * BAR, BAR, 0), (3 * BAR, BAR, 0)]);
         p.toggle_bar(drums, 0, beat);
-        assert_eq!(clips_on(&p, drums), [(0, BAR, 0), (BAR, BAR, 0), (2 * BAR, BAR, 0), (3 * BAR, BAR, 0)]);
+        assert_eq!(clips_on(&p, drums), [(0, 4 * BAR, 0)]);
         // Past the end, a track repeats its nearest pattern; an empty track uses the fallback.
         p.toggle_bar(drums, 6, named(&p, "Chords").id);
         assert_eq!(p.clip_at(drums, 6 * BAR).unwrap().pattern, beat);
@@ -1065,6 +1202,107 @@ mod tests {
         p.toggle_bar(empty, 2, beat);
         assert_eq!(clips_on(&p, empty), [(2 * BAR, BAR, 0)]);
         assert_eq!(p.compile().loop_end, 7 * BAR);
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn clips_repeat_their_pattern() {
+        let (mut p, ch, pat, _, clip) = tiny();
+        p.add_note(pat, ch, STEP_PITCH, PPQ, STEP, DEFAULT_VEL).unwrap(); // beats 1 and 2
+        let c = p.clips.iter_mut().find(|c| c.id == clip).unwrap();
+        (c.len, c.offset) = (2 * BAR + PPQ, PPQ);
+        let starts = |p: &Project| p.compile().notes.iter().map(|n| n.start).collect::<Vec<_>>();
+        // From beat 2 for two bars and a beat: beat 2, then beats 1 and 2 of each repeat.
+        assert_eq!(starts(&p), [0, BAR - PPQ, BAR, 2 * BAR - PPQ, 2 * BAR]);
+        assert_eq!(p.pattern_pos(pat, BAR + 5), Some(PPQ + 5));
+        let c = p.clips[0];
+        assert!(p.clip_plays(&c, 0) && p.clip_plays(&c, BAR - 1));
+        // One beat from beat 3 plays beat 3 only; from beat 4, with a wrap, beats 4 and 1.
+        let short = |offset, len| Clip { offset, len, ..c };
+        assert!(p.clip_plays(&short(2 * PPQ, PPQ), 2 * PPQ) && !p.clip_plays(&short(2 * PPQ, PPQ), PPQ));
+        assert!(p.clip_plays(&short(3 * PPQ, 2 * PPQ), 0) && !p.clip_plays(&short(3 * PPQ, 2 * PPQ), PPQ));
+        // A clip longer than a pattern it was placed with keeps playing it after it grows.
+        p.add_note(pat, ch, STEP_PITCH, BAR + PPQ, STEP, DEFAULT_VEL).unwrap();
+        assert_eq!(p.pattern(pat).unwrap().len, BAR + PPQ + STEP);
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn placing_and_moving_clips() {
+        let mut p = Project::demo();
+        let (chords, drums, melody) = (track_named(&p, "Chords"), track_named(&p, "Drums"), track_named(&p, "Melody"));
+        let beat = named(&p, "Pattern 1").id;
+        // Placing puts down the whole pattern and cuts away what was there.
+        let placed = p.place_clip(melody, beat, BAR + PPQ).unwrap();
+        assert_eq!(clips_on(&p, melody), [(0, BAR + PPQ, 0), (BAR + PPQ, BAR, 0), (2 * BAR + PPQ, 2 * BAR - PPQ, 2 * BAR + PPQ)]);
+        assert!(p.place_clip(melody, beat, p.max_end()).is_none());
+        let last = p.place_clip(drums, beat, p.max_end() - PPQ).unwrap();
+        assert_eq!(p.clips.iter().find(|c| c.id == last).unwrap().len, PPQ);
+
+        // Moving: up two tracks and a bar later, cutting the chords there; the ID stays.
+        let moved = p.shift_clips(&[placed], i64::from(BAR), -2, false);
+        assert_eq!(moved, [placed]);
+        assert_eq!(clips_on(&p, chords), [(0, 2 * BAR + PPQ, 0), (2 * BAR + PPQ, BAR, 0), (3 * BAR + PPQ, BAR - PPQ, 3 * BAR + PPQ)]);
+        assert_eq!(clips_on(&p, melody), [(0, BAR + PPQ, 0), (2 * BAR + PPQ, 2 * BAR - PPQ, 2 * BAR + PPQ)]);
+        // Shifts stop at the edges: no track above the first, no time before 0.
+        assert_eq!(p.clamp_shift(&[placed], -i64::from(10 * BAR), -3), (-i64::from(2 * BAR + PPQ), 0));
+        assert_eq!(p.clamp_shift(&[placed], 0, 9), (0, 2));
+        assert_eq!(p.clamp_shift(&[], 5, 5), (0, 0));
+
+        // Copying leaves the original; copies get new IDs and keep the offset.
+        let first_two: Vec<ClipId> = p.clips.iter().filter(|c| c.track == melody).map(|c| c.id).collect();
+        let copies = p.shift_clips(&first_two, i64::from(8 * BAR), 0, true);
+        assert!(copies.iter().all(|c| !first_two.contains(c)) && copies.len() == 2);
+        assert_eq!(clips_on(&p, melody)[2..], [(8 * BAR, BAR + PPQ, 0), (10 * BAR + PPQ, 2 * BAR - PPQ, 2 * BAR + PPQ)]);
+        // A copy dropped over its own original cuts it.
+        let one = p.clips.iter().find(|c| c.track == melody && c.start == 8 * BAR).unwrap().id;
+        p.shift_clips(&[one], i64::from(BAR), 0, true);
+        assert_eq!(clips_on(&p, melody)[2..4], [(8 * BAR, BAR, 0), (9 * BAR, BAR + PPQ, 0)]);
+
+        p.remove_clips(&copies);
+        assert!(p.clips.iter().all(|c| !copies.contains(&c.id)));
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn resizing_clips() {
+        let (mut p, _, pat, tr, clip) = tiny();
+        let other = p.add_clip(tr, pat, 3 * BAR, BAR).unwrap();
+        // Dragging the end out repeats the pattern, over the next clip, which is cut.
+        assert!(p.resize_clip(clip, Edge::End, 3 * BAR + PPQ, STEP));
+        assert_eq!(clips_on(&p, tr), [(0, 3 * BAR + PPQ, 0), (3 * BAR + PPQ, BAR - PPQ, PPQ)]);
+        assert_eq!(p.compile().notes.len(), 4);
+        // Dragging the start keeps the notes in place in the song.
+        assert!(p.resize_clip(clip, Edge::Start, PPQ, STEP));
+        assert_eq!(clips_on(&p, tr)[0], (PPQ, 3 * BAR, PPQ));
+        assert!(p.resize_clip(clip, Edge::Start, 0, STEP));
+        assert_eq!(clips_on(&p, tr)[0], (0, 3 * BAR + PPQ, 0));
+        // Out past the pattern's start: the offset wraps around to the pattern's end.
+        p.shift_clips(&[clip], i64::from(BAR), 0, false);
+        assert!(p.resize_clip(clip, Edge::Start, BAR - PPQ, STEP));
+        assert_eq!(clips_on(&p, tr)[0], (BAR - PPQ, 3 * BAR + 2 * PPQ, BAR - PPQ));
+        // A clip never shrinks below the minimum or past the song limit.
+        assert!(p.resize_clip(clip, Edge::End, 0, STEP));
+        assert_eq!(clips_on(&p, tr)[0], (BAR - PPQ, STEP, BAR - PPQ));
+        assert!(p.resize_clip(clip, Edge::Start, 10 * BAR, STEP));
+        assert_eq!(clips_on(&p, tr)[0], (BAR - PPQ, STEP, BAR - PPQ));
+        assert!(p.resize_clip(clip, Edge::End, Tick::MAX, STEP));
+        assert_eq!(p.clips.iter().find(|c| c.id == clip).unwrap().end(), p.max_end());
+        assert!(clips_on(&p, tr).len() == 1 && p.clips.iter().all(|c| c.id != other));
+        assert!(!p.resize_clip(ClipId(999), Edge::End, BAR, STEP));
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn loop_range() {
+        let mut p = Project::demo();
+        p.set_loop(2 * BAR, BAR);
+        assert_eq!(p.loop_range, Some((BAR, 2 * BAR)));
+        assert_eq!((p.compile().loop_start, p.compile().loop_end), (BAR, 2 * BAR));
+        p.set_loop(0, Tick::MAX);
+        assert_eq!(p.loop_range, Some((0, p.max_end())));
+        p.set_loop(BAR, BAR);
+        assert_eq!(p.loop_range, None);
         p.validate().unwrap();
     }
 

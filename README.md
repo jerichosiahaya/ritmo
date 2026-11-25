@@ -10,7 +10,7 @@ cargo run --release
 
 - **Toolbar:** play/stop, an LCD with bar:step and tempo, BPM, swing and master knobs, buttons to show and hide windows, and Export.
 - **Browser (left):** instruments, chords and patterns. Click an instrument to edit it in the piano roll (drums: to play it from the keyboard). Click a chord to put it on the selected Playlist bar, or drag it onto any bar. Click a pattern to edit its steps; double-click opens it in the piano roll.
-- **Playlist (F5):** tracks of pattern clips. Click an empty bar to place the track's pattern there; click a clip to select a bar, double-click to edit it, right-click to put a chord on that bar or cut the bar out. Click a track name to mute it. Chord bars show the chord's name.
+- **Playlist (F5):** tracks of pattern clips, as long as the song needs (up to 999 bars). Click an empty spot to place the selected pattern. Drag a clip to move it (to another track too), Ctrl+drag to copy it, drag either edge to resize it: a clip longer than its pattern repeats it. Ctrl+click selects several clips to move together; Delete removes the selection. Double-click a clip to edit its pattern; right-click to delete it, cut a bar out or put a chord on a bar. Clips snap to bars, beats or steps (hold Alt to place freely); a clip dropped on others cuts them away. Drag on the ruler to loop part of the song, double-click it to clear the loop. Ctrl+scroll or －/＋ zooms. Click a track name to mute it. Chord bars show the chord's name.
 - **Channel Rack (F6):** for each channel, an on/off LED, pan and volume knobs, and step buttons for drums (in the pattern picked at the top); melodic channels show what they play across the song.
 - **Piano Roll (F7):** one channel's notes in one pattern, on a 16th grid. Left-drag draws (cells next to a note join it), right-drag erases, ▲/▼ change octave, click a key to hear it.
 - **Sampler (F8):** chop any audio onto 16 pads. Load a WAV, FLAC, MP3, OGG or AIFF file (or drop it on the window): it becomes a chop channel, chopped at its hits. Re-chop at the hits (with a sensitivity slider), into 8 or 16 equal slices, or by tapping Enter while it plays. Drag chop points on the waveform, double-click to add one, right-click to remove one. Each pad has pitch (which changes speed, like a turntable), reverse and level; One-shot plays whole slices, Cut itself stops the previous chop. Chops are notes, so you sequence them in the Piano Roll (one row per pad) and Playlist like any instrument.
@@ -33,8 +33,9 @@ Knobs: drag up/down, scroll, or use the arrow keys; double-click resets.
 - `Z S X D C V G B H N J M` = C3 octave, `Q 2 W 3 E R 5 T 6 Y 7 U I 9 O 0 P` = C4 octave, played on the selected channel (outlined in the Channel Rack; the status bar names it).
 - On a chop channel the same keys play pads 1–16: `Z S X D C V G B H N J M Q 2 W 3`. While tap-chopping, **Enter** taps and **Esc** finishes.
 - **Space** = play/stop. **F5 / F6 / F7 / F8 / F9** = Playlist / Channel Rack / Piano Roll / Sampler / Mixer.
+- **Delete** = remove the selected clips. **Esc** = cancel a playlist drag, or clear the clip selection.
 - **Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S** = new / open / save / save as. **Ctrl+Z / Ctrl+Shift+Z (Ctrl+Y)** = undo / redo.
-- **Export** writes `~/Music/<project name>.wav` (or `ritmo-export.wav` before the first save): the song twice plus a 2 s tail.
+- **Export** writes `~/Music/<project name>.wav` (or `ritmo-export.wav` before the first save): the whole song once (ignoring the loop range) plus a 2 s tail.
 
 Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian/Ubuntu).
 

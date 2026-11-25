@@ -1,8 +1,8 @@
-//! The four floating windows: Playlist, Channel Rack, Piano Roll and Mixer. They edit
+//! The floating windows: Playlist, Channel Rack, Piano Roll, Sampler and Mixer. They edit
 //! `app.project` through its editing operations and draw previews from `app.snap`.
 
 use crate::engine::*;
-use crate::project::{CHOP_BASE, CHORDS, ChannelId, Clip, MAX_SLICES, Note, PatternId, Project};
+use crate::project::{CHOP_BASE, CHORDS, ChannelId, Clip, ClipId, Edge, MAX_BARS, MAX_SLICES, Note, PatternId, Project};
 use crate::sample;
 use crate::widgets::*;
 use crate::{App, Win, channel_color, chord_color, pattern_color};
@@ -31,10 +31,10 @@ pub fn show(app: &mut App, ctx: &egui::Context, area: Rect) {
     };
     let chop_title = app.chop_ch.and_then(|c| app.project.channel(c)).map_or("Sampler".into(), |c| format!("Sampler — {}", c.name));
     let specs: [(Win, &str, Pos2, [f32; 2]); 5] = [
-        (Win::Playlist, "Playlist", o + vec2(16.0, 16.0), [700.0, 190.0]),
-        (Win::Rack, "Channel Rack", o + vec2(16.0, 250.0), [560.0, 250.0]),
+        (Win::Playlist, "Playlist", o + vec2(16.0, 16.0), [860.0, 236.0]),
+        (Win::Rack, "Channel Rack", o + vec2(16.0, 290.0), [560.0, 250.0]),
         (Win::Roll, &roll_title, o + vec2(80.0, 60.0), [760.0, 420.0]),
-        (Win::Mixer, "Mixer", o + vec2(600.0, 250.0), [620.0, 270.0]),
+        (Win::Mixer, "Mixer", o + vec2(600.0, 290.0), [620.0, 270.0]),
         (Win::Chop, &chop_title, o + vec2(120.0, 40.0), [760.0, 430.0]),
     ];
     for (w, title, pos, size) in specs {
@@ -292,7 +292,7 @@ fn piano_roll(app: &mut App, ui: &mut Ui) {
         }
         // Notes; dimmed where no playlist clip plays that part of the pattern.
         let project = &app.project;
-        let audible = |t: Tick| project.clips.iter().any(|c| c.pattern == pat && (c.offset..c.offset + c.len).contains(&t));
+        let audible = |t: Tick| project.clips.iter().any(|c| c.pattern == pat && project.clip_plays(c, t));
         let px = |t: Tick| grid.left() + t as f32 / STEP as f32 * CELL_W;
         let visible = low..low.saturating_add(ROLL_KEYS as u8);
         for n in project.pattern(pat).into_iter().flat_map(|p| &p.notes).filter(|n| n.channel == ch && visible.contains(&n.pitch)) {
@@ -315,39 +315,201 @@ fn piano_roll(app: &mut App, ui: &mut Ui) {
 // Playlist
 
 const LABEL_W: f32 = 96.0;
-const BAR_W: f32 = 140.0;
 const TRACK_H: f32 = 40.0;
+/// How near a clip's edge (in pixels) a drag resizes it instead of moving it.
+const EDGE_W: f32 = 7.0;
+/// Bar widths the zoom allows, in pixels.
+pub const BAR_W: std::ops::RangeInclusive<f32> = 24.0..=480.0;
+
+/// What playlist drags snap to. Holding Alt places freely.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Snap {
+    Bar,
+    Beat,
+    Step,
+}
+
+impl Snap {
+    const ALL: [Snap; 3] = [Snap::Bar, Snap::Beat, Snap::Step];
+
+    fn ticks(self, bar: Tick) -> Tick {
+        match self {
+            Snap::Bar => bar,
+            Snap::Beat => PPQ,
+            Snap::Step => STEP,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Snap::Bar => "Bar",
+            Snap::Beat => "Beat",
+            Snap::Step => "Step",
+        }
+    }
+}
+
+/// A playlist drag in progress. The playlist shows what dropping it would do; the project
+/// changes when it is dropped. `grab` is where it was picked up: song tick and track row.
+pub enum ClipDrag {
+    /// Selected clips moved together (copied if Ctrl is held at the drop); `anchor`, the one
+    /// grabbed, snaps to the grid.
+    Move { clips: Vec<ClipId>, anchor: ClipId, grab: (f32, f32) },
+    Resize { clip: ClipId, edge: Edge, grab: (f32, f32) },
+    /// A loop range being dragged out on the ruler from `from`.
+    Loop { from: Tick },
+}
+
+/// Applies `drag` to `p` as if dropped at song tick `tick`, track row `row`; returns the clips
+/// to select after it.
+fn drop_drag(p: &mut Project, drag: &ClipDrag, tick: f32, row: f32, unit: Tick, copy: bool) -> Vec<ClipId> {
+    let snap = |t: f32| (t / unit as f32).round().max(0.0) as Tick * unit;
+    match drag {
+        ClipDrag::Move { clips, anchor, grab } => {
+            let Some(a) = p.clips.iter().find(|c| c.id == *anchor) else { return Vec::new() };
+            let dt = i64::from(snap(a.start as f32 + tick - grab.0)) - i64::from(a.start);
+            p.shift_clips(clips, dt, (row - grab.1).round() as i64, copy)
+        }
+        ClipDrag::Resize { clip, edge, grab } => {
+            let Some(c) = p.clips.iter().find(|c| c.id == *clip).copied() else { return Vec::new() };
+            let at = if *edge == Edge::Start { c.start } else { c.end() };
+            p.resize_clip(*clip, *edge, snap(at as f32 + tick - grab.0), unit.max(STEP));
+            vec![*clip]
+        }
+        ClipDrag::Loop { from } => {
+            let to = snap(tick);
+            if to != *from {
+                p.set_loop(*from, to);
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// "3" for the start of bar 3, "3.2" for its second beat (in ticks otherwise).
+fn bar_beat(t: Tick, bar: Tick) -> String {
+    match (t % bar, t % PPQ) {
+        (0, _) => format!("{}", t / bar + 1),
+        (b, 0) => format!("{}.{}", t / bar + 1, b / PPQ + 1),
+        _ => format!("{}.{}+{}", t / bar + 1, t % bar / PPQ + 1, t % PPQ),
+    }
+}
+
+fn playlist_header(app: &mut App, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        if ui.small_button("＋ Track").on_hover_text("Add an empty playlist track").clicked() {
+            app.project.new_track();
+        }
+        ui.separator();
+        ui.label("Snap");
+        egui::ComboBox::from_id_salt("playlist-snap")
+            .width(60.0)
+            .selected_text(app.grid.name())
+            .show_ui(ui, |ui| {
+                for s in Snap::ALL {
+                    ui.selectable_value(&mut app.grid, s, s.name());
+                }
+            })
+            .response
+            .on_hover_text("What clips and the loop snap to while dragging. Hold Alt to place freely.");
+        if ui.small_button("－").on_hover_text("Zoom out (Ctrl+scroll)").clicked() {
+            app.bar_w = (app.bar_w / 1.25).clamp(*BAR_W.start(), *BAR_W.end());
+        }
+        if ui.small_button("＋").on_hover_text("Zoom in (Ctrl+scroll)").clicked() {
+            app.bar_w = (app.bar_w * 1.25).clamp(*BAR_W.start(), *BAR_W.end());
+        }
+        ui.separator();
+        let bl = app.project.bar_len();
+        match app.project.loop_range {
+            Some((a, b)) => {
+                let text = match (a % bl, b % bl) {
+                    (0, 0) if b - a == bl => format!("⟲ Loop bar {}", a / bl + 1),
+                    (0, 0) => format!("⟲ Loop bars {}–{}", a / bl + 1, b / bl),
+                    _ => format!("⟲ Loop {} → {}", bar_beat(a, bl), bar_beat(b, bl)),
+                };
+                ui.label(RichText::new(text).color(ACCENT));
+                if ui.small_button("✕").on_hover_text("Clear the loop: play the whole song").clicked() {
+                    app.project.loop_range = None;
+                }
+            }
+            None => {
+                ui.label(RichText::new("Drag on the ruler to loop part of the song").small().weak());
+            }
+        }
+    });
+}
 
 fn playlist(app: &mut App, ui: &mut Ui) {
+    playlist_header(app, ui);
     let bl = app.project.bar_len();
-    // The song's bars plus one empty bar to extend into.
-    let bars = (app.project.end().div_ceil(bl) + 1).max(4);
-    let rows = app.project.tracks.len();
-    if ui.small_button("＋ Track").on_hover_text("Add an empty playlist track").clicked() {
-        app.project.new_track();
+    let (alt, command, pointer) = ui.input(|i| (i.modifiers.alt, i.modifiers.command, i.pointer.latest_pos()));
+    let unit = if alt { 1 } else { app.grid.ticks(bl) };
+    // Ctrl+scroll zooms.
+    let zoom = ui.input(|i| i.zoom_delta());
+    if zoom != 1.0 && ui.rect_contains_pointer(ui.max_rect()) {
+        app.bar_w = (app.bar_w * zoom).clamp(*BAR_W.start(), *BAR_W.end());
     }
     let mut delete = None;
-    egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
-        let size = vec2(LABEL_W + BAR_W * bars as f32, RULER_H + TRACK_H * rows as f32);
+    egui::ScrollArea::both().auto_shrink([false, true]).show(ui, |ui| {
+        let bar_w = app.bar_w;
+        let top_left = ui.cursor().min;
+        let gx = top_left.x + LABEL_W;
+        let x = |t: Tick| gx + t as f32 / bl as f32 * bar_w;
+        let tick_at = |px: f32| ((px - gx) / bar_w * bl as f32).max(0.0);
+        let row_at = |py: f32| (py - top_left.y - RULER_H) / TRACK_H;
+
+        // While dragging, draw the playlist as the drop would leave it.
+        let mut view = None;
+        if let (Some(drag), Some(pos)) = (&app.clip_drag, pointer) {
+            let mut p = app.project.clone();
+            let sel = drop_drag(&mut p, drag, tick_at(pos.x), row_at(pos.y), unit, command);
+            view = Some((p.clips, p.loop_range, sel));
+        }
+        let (clips, loop_range, selected) = match view {
+            Some(v) => v,
+            None => (app.project.clips.clone(), app.project.loop_range, app.sel_clips.clone()),
+        };
+
+        // The song, the loop and room to grow into.
+        let end = clips.iter().map(Clip::end).chain(loop_range.map(|l| l.1)).max().unwrap_or(0);
+        let bars = (end.div_ceil(bl) + 8).clamp(16, MAX_BARS);
+        let rows = app.project.tracks.len();
+        let size = vec2(LABEL_W + bar_w * bars as f32, RULER_H + TRACK_H * rows as f32);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-        let gx = rect.left() + LABEL_W;
-        let x = |t: Tick| gx + t as f32 / bl as f32 * BAR_W;
+        let lanes = Rect::from_min_max(Pos2::new(gx, rect.top() + RULER_H), rect.max);
         ui.painter().rect_filled(rect, 0, BG_DEEP);
 
-        // Ruler: click a bar number to select that bar.
-        for bar in 0..bars {
-            let r = Rect::from_min_size(Pos2::new(gx + bar as f32 * BAR_W, rect.top()), vec2(BAR_W, RULER_H));
-            if ui.interact(r, ui.scope_id().with(("ruler", bar)), Sense::click()).on_hover_text("Select bar").clicked() {
-                app.sel_bar = bar;
-            }
+        // Ruler: click selects a bar, drag sets the loop, double-click clears it.
+        let ruler = Rect::from_min_max(Pos2::new(gx, rect.top()), Pos2::new(rect.right(), rect.top() + RULER_H));
+        let resp = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag()).on_hover_text("Click: select a bar · drag: loop that part · double-click: clear the loop");
+        let snap = |t: f32| (t / unit as f32).round() as Tick * unit;
+        if resp.drag_started()
+            && let Some(o) = ui.input(|i| i.pointer.press_origin())
+        {
+            app.clip_drag = Some(ClipDrag::Loop { from: snap(tick_at(o.x)) });
+        }
+        if resp.double_clicked() {
+            app.project.loop_range = None;
+        } else if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            app.sel_bar = tick_at(pos.x) as Tick / bl;
+        }
+        let p = ui.painter();
+        if let Some((a, b)) = loop_range {
+            let band = Rect::from_min_max(Pos2::new(x(a), ruler.top()), Pos2::new(x(b), ruler.bottom()));
+            p.rect_filled(band, 2, ACCENT.gamma_multiply(0.45));
+        }
+        let label_every = ((40.0 / bar_w).ceil() as Tick).max(1);
+        for bar in (0..bars).step_by(label_every as usize) {
             let col = if app.sel_bar == bar { ACCENT_HOT } else { Color32::from_gray(190) };
-            ui.painter().text(r.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, format!("{}", bar + 1), FontId::proportional(12.0), col);
+            p.text(Pos2::new(x(bar * bl) + 4.0, ruler.center().y), Align2::LEFT_CENTER, format!("{}", bar + 1), FontId::proportional(12.0), col);
         }
 
         for row in 0..rows {
             let t = &app.project.tracks[row];
             let (track, name, muted) = (t.id, t.name.clone(), t.mute);
-            let y = rect.top() + RULER_H + row as f32 * TRACK_H;
+            let y = lanes.top() + row as f32 * TRACK_H;
             // Track label: click mutes.
             let label = Rect::from_min_size(Pos2::new(rect.left(), y), vec2(LABEL_W - 4.0, TRACK_H)).shrink(2.0);
             let resp = ui.interact(label, ui.scope_id().with(("track", row)), Sense::click()).on_hover_text("Click to mute or unmute · right-click to rename or delete");
@@ -367,81 +529,167 @@ fn playlist(app: &mut App, ui: &mut Ui) {
             p.rect_filled(Rect::from_min_size(label.min, vec2(4.0, label.height())), 2, if muted { Color32::from_gray(80) } else { channel_color(row * 2) });
             let text_col = if muted { Color32::from_gray(110) } else { Color32::from_gray(220) };
             p.text(label.left_center() + vec2(10.0, 0.0), Align2::LEFT_CENTER, &name, FontId::proportional(13.0), text_col);
-            let lane = Rect::from_min_size(Pos2::new(gx, y), vec2(BAR_W * bars as f32, TRACK_H));
-            p.rect_filled(lane, 0, if row % 2 == 0 { Color32::from_rgb(40, 44, 50) } else { Color32::from_rgb(36, 40, 45) });
 
-            for c in app.project.clips.iter().filter(|c| c.track == track) {
-                let r = Rect::from_min_max(Pos2::new(x(c.start), y), Pos2::new(x(c.end()), y + TRACK_H)).shrink(2.0);
-                draw_clip(ui, &app.project, c, r, muted);
+            // The empty lane: click places the selected pattern.
+            let lane = Rect::from_min_size(Pos2::new(gx, y), vec2(bar_w * bars as f32, TRACK_H));
+            p.rect_filled(lane, 0, if row % 2 == 0 { Color32::from_rgb(40, 44, 50) } else { Color32::from_rgb(36, 40, 45) });
+            let pattern_name = app.project.pattern(app.pattern).map_or("—".into(), |p| p.name.clone());
+            let resp = ui.interact(lane, ui.scope_id().with(("lane", row)), Sense::click()).on_hover_text(format!("Click: place {pattern_name} (pick another in the browser or Channel Rack)"));
+            if resp.clicked()
+                && let Some(pos) = resp.interact_pointer_pos()
+            {
+                let at = tick_at(pos.x) as Tick / unit * unit;
+                if let Some(c) = app.project.place_clip(track, app.pattern, at) {
+                    app.sel_clips = vec![c];
+                }
+                (app.sel_track, app.sel_bar) = (Some(track), at / bl);
             }
 
-            // Bar cells: click places the track's pattern or selects the bar; double-click edits;
-            // right-click stamps chords or cuts the bar; chords from the browser drop here.
-            for bar in 0..bars {
-                let r = Rect::from_min_size(Pos2::new(gx + bar as f32 * BAR_W, y), vec2(BAR_W, TRACK_H)).shrink(2.0);
-                let resp = ui.interact(r, ui.scope_id().with(("cell", row, bar)), Sense::click());
-                let clip = app.project.clip_at(track, bar * bl).copied();
-                if resp.double_clicked() {
-                    if let Some(c) = clip {
-                        edit_pattern(app, c.pattern);
+            for &c in clips.iter().filter(|c| c.track == track) {
+                let r = Rect::from_min_max(Pos2::new(x(c.start), y), Pos2::new(x(c.end()), y + TRACK_H)).shrink2(vec2(1.0, 2.0));
+                let resp = ui.interact(r, ui.scope_id().with(("clip", c.id)), Sense::click_and_drag());
+                let edge_w = EDGE_W.min(r.width() / 4.0);
+                let edge_at = |px: f32| {
+                    if px < r.left() + edge_w {
+                        Some(Edge::Start)
+                    } else if px > r.right() - edge_w {
+                        Some(Edge::End)
+                    } else {
+                        None
                     }
-                } else if resp.clicked() {
-                    if clip.is_none() {
-                        app.project.toggle_bar(track, bar, app.pattern);
-                    }
-                    (app.sel_track, app.sel_bar) = (Some(track), bar);
+                };
+                let is_sel = selected.contains(&c.id);
+                if app.clip_drag.is_none()
+                    && let Some(h) = resp.hover_pos()
+                    && edge_at(h.x).is_some()
+                {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
-                if let Some(j) = resp.dnd_release_payload::<usize>() {
-                    if clip.is_none() {
-                        app.project.toggle_bar(track, bar, app.pattern);
-                    }
-                    app.stamp_chord(track, bar, *j);
-                    (app.sel_track, app.sel_bar) = (Some(track), bar);
-                }
-                let p = ui.painter();
-                if app.sel_track == Some(track) && app.sel_bar == bar {
-                    p.rect_stroke(r, 3, Stroke::new(2.0, ACCENT_HOT), StrokeKind::Outside);
-                }
-                if resp.dnd_hover_payload::<usize>().is_some() {
-                    p.rect_stroke(r, 3, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
-                }
-                let hint = if clip.is_some() { "Click: select · double-click: edit · right-click: chord or cut" } else { "Click: place this track's pattern here" };
-                resp.on_hover_text(hint).context_menu(|ui| {
-                    if clip.is_none() {
-                        if ui.button("Place pattern").clicked() {
-                            app.project.toggle_bar(track, bar, app.pattern);
-                            ui.close();
+                let bar_here = || resp.interact_pointer_pos().map_or(c.start, |p| tick_at(p.x) as Tick) / bl;
+                if resp.drag_started()
+                    && let Some(o) = ui.input(|i| i.pointer.press_origin())
+                {
+                    let grab = (tick_at(o.x), row_at(o.y));
+                    app.clip_drag = Some(match edge_at(o.x) {
+                        Some(edge) => ClipDrag::Resize { clip: c.id, edge, grab },
+                        None => {
+                            if !app.sel_clips.contains(&c.id) {
+                                app.sel_clips = vec![c.id];
+                            }
+                            ClipDrag::Move { clips: app.sel_clips.clone(), anchor: c.id, grab }
                         }
+                    });
+                }
+                if resp.double_clicked() {
+                    edit_pattern(app, c.pattern);
+                } else if resp.clicked() {
+                    if command {
+                        if let Some(i) = app.sel_clips.iter().position(|&s| s == c.id) {
+                            app.sel_clips.remove(i);
+                        } else {
+                            app.sel_clips.push(c.id);
+                        }
+                    } else {
+                        app.sel_clips = vec![c.id];
+                    }
+                    (app.sel_track, app.sel_bar) = (Some(track), bar_here());
+                }
+                if resp.secondary_clicked() {
+                    if !app.sel_clips.contains(&c.id) {
+                        app.sel_clips = vec![c.id];
+                    }
+                    (app.sel_track, app.sel_bar) = (Some(track), bar_here());
+                }
+                draw_clip(ui, &app.project, &c, r, muted, bar_w, is_sel);
+                let tip = "Drag: move (Ctrl: copy) · drag an edge: resize · double-click: edit · Ctrl+click: select more · right-click: more";
+                resp.on_hover_text(tip).context_menu(|ui| {
+                    let n = app.sel_clips.len();
+                    if ui.button(if n > 1 { format!("🗑 Delete {n} clips") } else { "🗑 Delete clip".into() }).clicked() {
+                        app.project.remove_clips(&app.sel_clips);
+                        app.sel_clips.clear();
+                        ui.close();
                         return;
                     }
-                    if ui.button("✂ Cut this bar").clicked() {
-                        app.project.toggle_bar(track, bar, app.pattern);
+                    if ui.button(format!("✂ Cut out bar {}", app.sel_bar + 1)).clicked() {
+                        app.project.toggle_bar(track, app.sel_bar, app.pattern);
+                        app.sel_clips.clear();
                         ui.close();
+                        return;
                     }
                     ui.separator();
-                    ui.label(RichText::new("Put a chord here").small().weak());
+                    ui.label(RichText::new(format!("Chord on bar {}", app.sel_bar + 1)).small().weak());
                     for (k, chord) in CHORDS.iter().enumerate() {
                         if ui.button(if k == 0 { "— (clear)" } else { chord.name }).clicked() {
-                            app.stamp_chord(track, bar, k);
+                            app.stamp_chord(track, app.sel_bar, k);
                             ui.close();
                         }
                     }
                 });
             }
-        }
-        for bar in 0..=bars {
-            let px = gx + bar as f32 * BAR_W;
-            ui.painter().line_segment([Pos2::new(px, rect.top()), Pos2::new(px, rect.bottom())], Stroke::new(1.0, Color32::from_gray(70)));
+            if app.sel_track == Some(track) {
+                let cell = Rect::from_min_size(Pos2::new(x(app.sel_bar * bl), y), vec2(bar_w, TRACK_H)).shrink(1.0);
+                ui.painter().rect_stroke(cell, 3, Stroke::new(1.0, ACCENT_HOT.gamma_multiply(0.6)), StrokeKind::Inside);
+            }
         }
 
+        // Chords dragged from the browser drop on a bar.
+        if let Some(pos) = pointer.filter(|p| lanes.contains(*p) && ui.clip_rect().contains(*p))
+            && egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+            && let Some(track) = app.project.tracks.get(row_at(pos.y) as usize).map(|t| t.id)
+        {
+            let bar = tick_at(pos.x) as Tick / bl;
+            let row = row_at(pos.y).floor();
+            let cell = Rect::from_min_size(Pos2::new(x(bar * bl), lanes.top() + row * TRACK_H), vec2(bar_w, TRACK_H));
+            ui.painter().rect_stroke(cell.shrink(2.0), 3, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
+            if ui.input(|i| i.pointer.any_released())
+                && let Some(j) = egui::DragAndDrop::take_payload::<usize>(ui.ctx())
+            {
+                if app.project.clip_at(track, bar * bl).is_none() {
+                    app.project.toggle_bar(track, bar, app.pattern);
+                }
+                app.stamp_chord(track, bar, *j);
+                (app.sel_track, app.sel_bar) = (Some(track), bar);
+            }
+        }
+
+        // Grid: bars, and beats when there is room.
+        let p = ui.painter();
+        for bar in 0..=bars {
+            p.line_segment([Pos2::new(x(bar * bl), rect.top()), Pos2::new(x(bar * bl), rect.bottom())], Stroke::new(1.0, Color32::from_gray(70)));
+            if bar_w >= 80.0 && bar < bars {
+                for beat in 1..app.project.beats_per_bar {
+                    let bx = x(bar * bl + beat * PPQ);
+                    p.line_segment([Pos2::new(bx, lanes.top()), Pos2::new(bx, rect.bottom())], Stroke::new(1.0, Color32::from_white_alpha(10)));
+                }
+            }
+        }
+        if let Some((a, b)) = loop_range {
+            for t in [a, b] {
+                p.line_segment([Pos2::new(x(t), rect.top()), Pos2::new(x(t), rect.bottom())], Stroke::new(1.0, ACCENT.gamma_multiply(0.7)));
+            }
+        }
         if let Some(c) = app.cur {
             let px = x(c);
-            ui.painter().line_segment([Pos2::new(px, rect.top()), Pos2::new(px, rect.bottom())], Stroke::new(2.0, ACCENT_HOT));
-            ui.painter().add(egui::Shape::convex_polygon(
-                vec![Pos2::new(px - 5.0, rect.top()), Pos2::new(px + 5.0, rect.top()), Pos2::new(px, rect.top() + 7.0)],
-                ACCENT_HOT,
-                Stroke::NONE,
-            ));
+            p.line_segment([Pos2::new(px, rect.top()), Pos2::new(px, rect.bottom())], Stroke::new(2.0, ACCENT_HOT));
+            p.add(egui::Shape::convex_polygon(vec![Pos2::new(px - 5.0, rect.top()), Pos2::new(px + 5.0, rect.top()), Pos2::new(px, rect.top() + 7.0)], ACCENT_HOT, Stroke::NONE));
+        }
+
+        // Drop the drag when the button comes up; scroll when it nears the edge.
+        if let (Some(_), Some(pos)) = (&app.clip_drag, pointer) {
+            if !ui.input(|i| i.pointer.any_down()) {
+                let drag = app.clip_drag.take().expect("checked above");
+                let sel = drop_drag(&mut app.project, &drag, tick_at(pos.x), row_at(pos.y), unit, command);
+                if !matches!(drag, ClipDrag::Loop { .. }) {
+                    app.sel_clips = sel;
+                }
+            } else {
+                let vis = ui.clip_rect();
+                let push = if pos.x > vis.right() - 24.0 { -12.0 } else if pos.x < vis.left() + LABEL_W + 24.0 && vis.left() > rect.left() { 12.0 } else { 0.0 };
+                if push != 0.0 {
+                    ui.scroll_with_delta(vec2(push, 0.0));
+                    ui.ctx().request_repaint();
+                }
+            }
         }
     });
     if let Some(id) = delete {
@@ -455,51 +703,60 @@ fn playlist(app: &mut App, ui: &mut Ui) {
 fn edit_pattern(app: &mut App, pattern: PatternId) {
     let project = &app.project;
     let melodic = project.pattern(pattern).and_then(|p| p.notes.iter().map(|n| n.channel).find(|&c| project.channel(c).is_some_and(|c| !c.instrument.is_drum())));
+    app.pattern = pattern;
     match melodic {
         Some(ch) => app.edit_in_roll(pattern, ch),
-        None => {
-            app.pattern = pattern;
-            app.open[Win::Rack as usize] = true;
-        }
+        None => app.open[Win::Rack as usize] = true,
     }
 }
 
-/// A clip: the pattern's name, a sketch of its notes, and chord names on chord bars.
-fn draw_clip(ui: &Ui, project: &Project, c: &Clip, r: Rect, muted: bool) {
+/// A clip: the pattern's name, a sketch of its notes (with a notch where the pattern repeats),
+/// and chord names on chord bars.
+fn draw_clip(ui: &Ui, project: &Project, c: &Clip, r: Rect, muted: bool, bar_w: f32, selected: bool) {
     let Some((i, pattern)) = project.patterns.iter().enumerate().find(|(_, p)| p.id == c.pattern) else { return };
     let p = ui.painter_at(r);
     let dim = if muted { 0.3 } else { 0.8 };
     let bl = project.bar_len();
-    let chords: Vec<(Tick, usize)> = (0..c.len.div_ceil(bl)).map(|b| (b, project.chord_at(c.pattern, c.offset + b * bl))).filter(|&(_, j)| j > 0).collect();
+    let outline = if selected { Stroke::new(2.0, Color32::WHITE) } else { Stroke::new(1.0, CLIP_TEXT.gamma_multiply(0.6)) };
+    let chords: Vec<(Tick, usize)> = (0..c.len.div_ceil(bl)).map(|b| (b, project.chord_at(c.pattern, project.clip_pos(c, b * bl)))).filter(|&(_, j)| j > 0).collect();
     if !chords.is_empty() {
         // Chord clips: one colored card per chord, named.
         p.rect_filled(r, 3, pattern_color(i).gamma_multiply(dim * 0.5));
         for (b, j) in chords {
-            let card = Rect::from_min_max(Pos2::new(r.left() + b as f32 * BAR_W, r.top()), Pos2::new((r.left() + (b + 1) as f32 * BAR_W - 4.0).min(r.right()), r.bottom()));
+            let card = Rect::from_min_max(Pos2::new(r.left() + b as f32 * bar_w, r.top()), Pos2::new((r.left() + (b + 1) as f32 * bar_w - 4.0).min(r.right()), r.bottom()));
             p.rect_filled(card, 3, chord_color(j).gamma_multiply(dim / 0.8));
             p.text(card.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, CHORDS[j].name, FontId::proportional(14.0), CLIP_TEXT);
         }
+        p.rect_stroke(r, 3, outline, StrokeKind::Inside);
         return;
     }
     p.rect_filled(r, 3, pattern_color(i).gamma_multiply(dim));
-    p.rect_stroke(r, 3, Stroke::new(1.0, CLIP_TEXT.gamma_multiply(0.6)), StrokeKind::Inside);
     p.text(r.left_top() + vec2(5.0, 3.0), Align2::LEFT_TOP, &pattern.name, FontId::proportional(11.0), CLIP_TEXT);
-
-    let notes: Vec<&Note> = pattern.notes.iter().filter(|n| (c.offset..c.offset + c.len).contains(&n.start)).collect();
-    // Drum patterns put every note on one pitch: sketch them by channel instead.
-    let one_pitch = notes.windows(2).all(|w| w[0].pitch == w[1].pitch);
-    let key = |n: &Note| if one_pitch { project.channel_index(n.channel).unwrap_or(0) as i32 } else { n.pitch as i32 };
-    let (lo, hi) = notes.iter().fold((i32::MAX, i32::MIN), |(lo, hi), n| (lo.min(key(n)), hi.max(key(n))));
-    let span = (hi - lo).max(1) as f32;
-    let tx = |t: Tick| r.left() + 5.0 + (t.min(c.offset + c.len) - c.offset) as f32 / c.len as f32 * (r.width() - 10.0);
-    for n in notes {
-        let y = r.bottom() - 6.0 - (key(n) - lo) as f32 / span * (r.height() - 22.0);
-        if one_pitch {
-            p.circle_filled(Pos2::new(tx(n.start) + 2.0, y), 1.8, CLIP_TEXT);
-        } else {
-            p.rect_filled(Rect::from_min_max(Pos2::new(tx(n.start), y - 1.0), Pos2::new(tx(n.end()).max(tx(n.start) + 2.0), y + 1.0)), 0, CLIP_TEXT);
+    let tx = |t: Tick| r.left() + t as f32 / c.len as f32 * r.width();
+    // Where the pattern starts over.
+    if pattern.len > 0 {
+        let first = (pattern.len - c.offset % pattern.len) % pattern.len;
+        for t in (first.max(pattern.len)..c.len).step_by(pattern.len as usize).chain((first > 0).then_some(first)) {
+            p.line_segment([Pos2::new(tx(t), r.top() + 3.0), Pos2::new(tx(t), r.top() + 9.0)], Stroke::new(1.5, CLIP_TEXT.gamma_multiply(0.7)));
         }
     }
+
+    let notes: Vec<(Tick, &Note)> = project.clip_notes(*c).collect();
+    // Drum patterns put every note on one pitch: sketch them by channel instead.
+    let one_pitch = notes.windows(2).all(|w| w[0].1.pitch == w[1].1.pitch);
+    let key = |n: &Note| if one_pitch { project.channel_index(n.channel).unwrap_or(0) as i32 } else { n.pitch as i32 };
+    let (lo, hi) = notes.iter().fold((i32::MAX, i32::MIN), |(lo, hi), (_, n)| (lo.min(key(n)), hi.max(key(n))));
+    let span = (hi - lo).max(1) as f32;
+    for (t, n) in notes {
+        let y = r.bottom() - 6.0 - (key(n) - lo) as f32 / span * (r.height() - 22.0);
+        if one_pitch {
+            p.circle_filled(Pos2::new(tx(t) + 2.0, y), 1.8, CLIP_TEXT);
+        } else {
+            let end = (t + n.len).min(c.len);
+            p.rect_filled(Rect::from_min_max(Pos2::new(tx(t), y - 1.0), Pos2::new(tx(end).max(tx(t) + 2.0), y + 1.0)), 0, CLIP_TEXT);
+        }
+    }
+    p.rect_stroke(r, 3, outline, StrokeKind::Inside);
 }
 
 // ---------------------------------------------------------------------------------------------

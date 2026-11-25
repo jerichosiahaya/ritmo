@@ -799,7 +799,7 @@ pub fn export_wav(path: &std::path::Path, snap: &Snapshot) -> Result<(), hound::
     let sr = 44100;
     let spec = hound::WavSpec { channels: 2, sample_rate: sr, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
     let mut w = hound::WavWriter::create(path, spec)?;
-    for frame in render_offline(snap, sr, 2) {
+    for frame in render_offline(snap, sr, 1) {
         for s in frame {
             w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
         }
@@ -1013,8 +1013,8 @@ mod tests {
         let frames = r.len() / 2;
         std::fs::remove_file(&path).unwrap();
         assert_eq!((spec.channels, spec.sample_rate), (2, 44100));
-        // 2 loops x 4 bars at 80 BPM = 24 s, plus 2 s tail.
-        assert_eq!(frames as usize, (24.0 * 44100.0) as usize + 88200);
+        // The song once: 4 bars at 80 BPM = 12 s, plus 2 s tail.
+        assert_eq!(frames as usize, (12.0 * 44100.0) as usize + 88200);
     }
 
     #[test]
