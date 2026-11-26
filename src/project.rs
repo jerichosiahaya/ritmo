@@ -972,6 +972,9 @@ impl Project {
     /// Adds a chop channel for the audio at `path` (`len` frames), as one slice covering it all.
     /// It routes to a "Chops" mixer track, added if there is room.
     pub fn add_chop_channel(&mut self, name: &str, path: PathBuf, len: u32) -> Option<ChannelId> {
+        if len == 0 {
+            return None;
+        }
         let mixer = match self.mixer.iter().find(|m| m.name == "Chops") {
             Some(m) => m.id,
             None => self.add_mixer_track("Chops").or(self.mixer.first().map(|m| m.id))?,
@@ -989,13 +992,17 @@ impl Project {
     }
 
     /// Re-chops at `points` (sorted, deduplicated, inside the sample, at most `MAX_SLICES`).
-    /// Slice `k` keeps the pitch, reverse and level slice `k` had.
+    /// Slice `k` keeps the pitch, reverse and level slice `k` had. With no point inside the
+    /// sample (e.g. chopping silence at its hits), one slice covers all of it.
     pub fn set_chop_points(&mut self, channel: ChannelId, points: &[u32]) {
         let Some(c) = self.chop_mut(channel) else { return };
         let mut pts: Vec<u32> = points.iter().copied().filter(|&p| p < c.len).collect();
         pts.sort_unstable();
         pts.dedup();
         pts.truncate(MAX_SLICES);
+        if pts.is_empty() {
+            pts.push(0);
+        }
         let old = std::mem::take(&mut c.slices);
         for (k, &start) in pts.iter().enumerate() {
             let end = pts.get(k + 1).copied().unwrap_or(c.len);
@@ -1172,6 +1179,13 @@ mod tests {
         let kick = channel_named(&p, "Kick");
         p.set_chop_points(kick, &[0, 10]);
         assert!(p.chop(kick).is_none() && p.chop_points(kick).is_empty());
+        // No point inside the sample: one slice covers it all. An empty sample can't be chopped.
+        p.set_chop_points(ch, &[]);
+        assert_eq!(p.chop_points(ch), [0]);
+        p.set_chop_points(ch, &[u32::MAX]);
+        assert_eq!(p.chop_points(ch), [0]);
+        p.validate().unwrap();
+        assert!(p.add_chop_channel("Empty", PathBuf::from("empty.wav"), 0).is_none());
     }
 
     #[test]
@@ -1376,6 +1390,228 @@ mod tests {
         assert!(p.pattern(pat).unwrap().notes.iter().all(|n| !pasted.contains(&n.id)));
         assert!(p.draw_note(pat, ch, 60, p.max_end(), STEP, 90).is_none());
         p.validate().unwrap();
+    }
+
+    /// Small deterministic random numbers for the stress test (xorshift).
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+        fn tick(&mut self, max: Tick) -> Tick {
+            self.below(u64::from(max)) as Tick
+        }
+        fn pick<T: Copy>(&mut self, items: &[T]) -> Option<T> {
+            (!items.is_empty()).then(|| items[self.below(items.len() as u64) as usize])
+        }
+        fn signed(&mut self, max: i64) -> i64 {
+            self.below(2 * max as u64 + 1) as i64 - max
+        }
+    }
+
+    /// One random edit, as the windows would make it. Returns what it did, for the failure log.
+    fn random_edit(p: &mut Project, r: &mut Rng) -> String {
+        let pats: Vec<PatternId> = p.patterns.iter().map(|x| x.id).collect();
+        let chans: Vec<ChannelId> = p.channels.iter().map(|x| x.id).collect();
+        let tracks: Vec<TrackId> = p.tracks.iter().map(|x| x.id).collect();
+        let clips: Vec<ClipId> = p.clips.iter().map(|x| x.id).collect();
+        let (Some(pat), Some(ch), Some(tr)) = (r.pick(&pats), r.pick(&chans), r.pick(&tracks)) else {
+            let id = p.new_pattern();
+            return format!("new pattern {id:?}");
+        };
+        let notes: Vec<NoteId> = p.pattern(pat).map_or(Vec::new(), |x| x.notes.iter().filter(|n| n.channel == ch).map(|n| n.id).collect());
+        let some_notes: Vec<NoteId> = notes.iter().copied().filter(|_| r.below(3) == 0).collect();
+        let some_clips: Vec<ClipId> = clips.iter().copied().filter(|_| r.below(3) == 0).collect();
+        let span = 8 * BAR;
+        match r.below(26) {
+            0 => {
+                let step = r.tick(64);
+                p.toggle_step(pat, ch, step);
+                format!("toggle_step {pat:?} {ch:?} {step}")
+            }
+            1 | 2 => {
+                let (pitch, start, len) = (r.below(128) as u8, r.tick(span), 1 + r.tick(2 * BAR));
+                p.draw_note(pat, ch, pitch, start, len, 1 + r.below(127) as u8);
+                format!("draw_note {pat:?} {ch:?} {pitch} {start} {len}")
+            }
+            3 => {
+                let (dt, dp, copy) = (r.signed(i64::from(2 * BAR)), r.signed(20), r.below(2) == 0);
+                p.shift_notes(pat, &some_notes, dt, dp, copy);
+                format!("shift_notes {some_notes:?} {dt} {dp} {copy}")
+            }
+            4 => {
+                let dl = r.signed(i64::from(BAR));
+                p.resize_notes(pat, &some_notes, dl, STEP);
+                format!("resize_notes {some_notes:?} {dl}")
+            }
+            5 => {
+                p.set_velocity(pat, &some_notes, r.below(200) as u8);
+                "set_velocity".into()
+            }
+            6 => {
+                p.remove_notes(pat, &some_notes);
+                format!("remove_notes {some_notes:?}")
+            }
+            7 => {
+                let copied: Vec<Note> = p.pattern(pat).map_or(Vec::new(), |x| x.notes.iter().filter(|n| some_notes.contains(&n.id)).copied().collect());
+                let at = r.tick(span);
+                p.paste_notes(pat, ch, &copied, at);
+                format!("paste_notes {} at {at}", copied.len())
+            }
+            8 => {
+                let (bar, chord) = (r.tick(10), r.below(CHORDS.len() as u64) as usize);
+                let res = p.stamp_chord_on_bar(tr, bar, chord);
+                format!("stamp_chord_on_bar {tr:?} {bar} {chord} {res:?}")
+            }
+            9 => {
+                let bar = r.tick(12);
+                p.toggle_bar(tr, bar, pat);
+                format!("toggle_bar {tr:?} {bar}")
+            }
+            10 => {
+                let at = r.tick(span);
+                p.place_clip(tr, pat, at);
+                format!("place_clip {tr:?} {pat:?} {at}")
+            }
+            11 => {
+                let (dt, rows, copy) = (r.signed(i64::from(4 * BAR)), r.signed(3), r.below(2) == 0);
+                p.shift_clips(&some_clips, dt, rows, copy);
+                format!("shift_clips {some_clips:?} {dt} {rows} {copy}")
+            }
+            12 => {
+                let Some(c) = r.pick(&clips) else { return "no clip to resize".into() };
+                let (edge, to) = (if r.below(2) == 0 { Edge::Start } else { Edge::End }, r.tick(span));
+                p.resize_clip(c, edge, to, STEP);
+                format!("resize_clip {c:?} {edge:?} {to}")
+            }
+            13 => {
+                p.remove_clips(&some_clips);
+                format!("remove_clips {some_clips:?}")
+            }
+            14 => {
+                let (a, b) = (r.tick(span), r.tick(span));
+                p.set_loop(a, b);
+                format!("set_loop {a} {b}")
+            }
+            15 => {
+                let id = p.clone_pattern(pat);
+                format!("clone_pattern {pat:?} -> {id:?}")
+            }
+            16 => {
+                let id = p.new_track();
+                format!("new_track {id:?}")
+            }
+            17 if pats.len() > 1 => {
+                p.remove_pattern(pat);
+                format!("remove_pattern {pat:?}")
+            }
+            18 if tracks.len() > 1 => {
+                p.remove_track(tr);
+                format!("remove_track {tr:?}")
+            }
+            19 if chans.len() > 2 => {
+                p.remove_channel(ch);
+                format!("remove_channel {ch:?}")
+            }
+            20 => {
+                let len = 1000 + r.tick(200_000);
+                let id = p.add_chop_channel("Chop", PathBuf::from("x.wav"), len);
+                format!("add_chop_channel {len} -> {id:?}")
+            }
+            21 => {
+                let Some(c) = chans.iter().copied().find(|&c| p.chop(c).is_some()) else { return "no chop".into() };
+                let len = p.chop(c).map_or(1, |x| x.len);
+                match r.below(4) {
+                    0 => {
+                        let pts: Vec<u32> = (0..r.below(20)).map(|_| r.tick(len)).collect();
+                        p.set_chop_points(c, &pts);
+                        format!("set_chop_points {pts:?}")
+                    }
+                    1 => {
+                        let at = r.tick(len);
+                        p.add_chop_point(c, at);
+                        format!("add_chop_point {at}")
+                    }
+                    2 => {
+                        let k = r.below(17) as usize;
+                        p.remove_chop_point(c, k);
+                        format!("remove_chop_point {k}")
+                    }
+                    _ => {
+                        let (k, to) = (r.below(17) as usize, r.tick(len + 100));
+                        p.move_chop_point(c, k, to);
+                        format!("move_chop_point {k} {to}")
+                    }
+                }
+            }
+            22 => {
+                let Some(c) = chans.iter().copied().find(|&c| p.chop(c).is_some()) else { return "no chop".into() };
+                let k = r.below(17) as usize;
+                if let Some(s) = p.slice_mut(c, k) {
+                    (s.pitch, s.reverse, s.gain) = (r.signed(48) as f32, r.below(2) == 0, r.below(4) as f32);
+                }
+                format!("slice_mut {k}")
+            }
+            23 => {
+                let id = p.new_pattern();
+                format!("new_pattern {id:?}")
+            }
+            _ => {
+                let (bar, chord) = (r.tick(4), r.below(CHORDS.len() as u64) as usize);
+                p.stamp_chord(pat, bar * BAR, BAR, chord);
+                format!("stamp_chord {pat:?} {bar} {chord}")
+            }
+        }
+    }
+
+    /// Hundreds of random edits: the project stays valid after every one, compiles to sorted
+    /// notes inside the song, survives a save and load, and undoes back to where it started.
+    #[test]
+    fn random_edits_keep_the_project_valid() {
+        for seed in 1..=6u64 {
+            let mut r = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
+            let start = Project::demo();
+            let mut p = start.clone();
+            let mut history = crate::history::History::new(&p);
+            // Every state the history commits, oldest first.
+            let mut states = vec![start.clone()];
+            let mut log = Vec::new();
+            for i in 0..400 {
+                log.push(random_edit(&mut p, &mut r));
+                let fail = |why: String| panic!("seed {seed}, edit {i}: {why}\nlast edits:\n{}", log[log.len().saturating_sub(8)..].join("\n"));
+                if let Err(e) = p.validate() {
+                    fail(e);
+                }
+                let snap = p.compile();
+                if !snap.notes.windows(2).all(|w| w[0].start <= w[1].start) || snap.notes.iter().any(|n| n.end <= n.start) || snap.loop_start >= snap.loop_end {
+                    fail("compiled notes out of order, empty, or an empty loop".into());
+                }
+                if i % 50 == 0 && crate::file::from_str(&crate::file::to_string(&p)).ok().as_ref() != Some(&p) {
+                    fail("save and load changed the project".into());
+                }
+                history.observe(&p, true);
+                if states.last() != Some(&p) {
+                    states.push(p.clone());
+                }
+            }
+            // Undo goes back step by step, as far as the history keeps (`LIMIT` steps).
+            let end = p.clone();
+            let mut back = states.len() - 1;
+            while history.undo(&mut p) {
+                back -= 1;
+                assert!(p == states[back], "seed {seed}: undo to step {back} gave a different project");
+            }
+            assert_eq!(states.len() - 1 - back, crate::history::LIMIT.min(states.len() - 1), "seed {seed}");
+            while history.redo(&mut p) {}
+            assert!(p == end, "seed {seed}: redo did not return to the end");
+        }
     }
 
     #[test]

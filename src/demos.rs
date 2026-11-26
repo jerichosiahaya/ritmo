@@ -6,6 +6,7 @@
 use crate::engine::{self, Fx, STEP, SampleData, Tick};
 use std::sync::Arc;
 use crate::file;
+use crate::engine::Instrument;
 use crate::project::{CHOP_BASE, CHORDS, ChannelId, DEFAULT_VEL, MAX_SLICES, PatternId, Project};
 use crate::sample;
 use std::fs;
@@ -199,4 +200,46 @@ fn demos_open() {
         seen += 1;
     }
     assert_eq!(seen, 3);
+}
+
+/// How much faster than real time each demo renders at 44.1 kHz: the headroom the audio thread
+/// has. `cargo test --release -- --ignored render_speed --nocapture`
+#[test]
+#[ignore = "benchmark; run in release"]
+fn render_speed() {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir()).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == file::EXTENSION)).collect();
+    paths.sort();
+    for path in paths {
+        let p = file::load(&path).unwrap();
+        let samples: Vec<(PathBuf, Arc<SampleData>)> = p.channels.iter().filter_map(|c| c.chop.as_ref()).map(|c| (c.path.clone(), Arc::new(sample::decode(&c.path).unwrap()))).collect();
+        let snap = p.compile_with(&|path| samples.iter().find(|(p, _)| p == path).map(|(_, d)| d.clone()));
+        let start = std::time::Instant::now();
+        let frames = engine::render_offline(&snap, 44100, 1).len();
+        let took = start.elapsed().as_secs_f64();
+        println!("{}: {:.1} s of audio in {:.2} s, {:.0}x real time", path.file_name().unwrap().display(), frames as f64 / 44100.0, took, frames as f64 / 44100.0 / took);
+    }
+    // The worst case: every channel the engine allows, each playing on every 16th, the pianos
+    // in four-note chords so every voice is busy and stealing.
+    let mut p = Project::blank();
+    let mixer = p.mixer[0].id;
+    let kinds = [Instrument::Kick, Instrument::Snare, Instrument::Hat, Instrument::Rhodes, Instrument::Bass];
+    for i in p.channels.len()..engine::MAX_CHANNELS {
+        p.add_channel(&format!("C{i}"), kinds[i % kinds.len()], mixer);
+    }
+    let pat = p.patterns[0].id;
+    let chans: Vec<ChannelId> = p.channels.iter().map(|c| c.id).collect();
+    for (i, &ch) in chans.iter().enumerate() {
+        for step in 0..16 {
+            for k in 0..4 {
+                p.add_note(pat, ch, 48 + (i % 12) as u8 + 4 * k, step * STEP, STEP, DEFAULT_VEL);
+            }
+        }
+    }
+    let track = p.tracks[0].id;
+    p.add_clip(track, pat, 0, 8 * p.bar_len());
+    let snap = p.compile();
+    let start = std::time::Instant::now();
+    let frames = engine::render_offline(&snap, 44100, 1).len();
+    let took = start.elapsed().as_secs_f64();
+    println!("worst case ({} channels, {} notes): {:.0}x real time", snap.channels.len(), snap.notes.len(), frames as f64 / 44100.0 / took);
 }

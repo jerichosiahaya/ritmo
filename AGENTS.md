@@ -34,12 +34,14 @@ Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian
 - The audio thread owns the `Engine` and drains the bounded queue from `engine::command_channel()` at the start of each callback. The UI sends with `try_send` and never blocks. Don't switch to an unbounded `mpsc::channel`: its receiver frees memory on the audio thread.
 - Chop samples reach the engine as `Arc<SampleData>` inside the snapshot (`compile_with` looks them up in the app's cache). The engine only reads them; the last reference is always dropped on the UI thread with the retired snapshot. A chop voice whose sample changes in a new snapshot stops at once.
 - The engine never drops a snapshot: it sends the one it replaces back through `engine::trash_channel()`, and the UI drops it each frame.
+- Playback starts at the cue (`Cmd::Seek`, set from the Playlist ruler; None means the loop start) and Stop returns there; a seek while playing jumps at once.
 - The audio thread reports back only through atomics: `pos` (playing tick + 1, or 0 when stopped) and `meters` (f32 peak bits, merged with `fetch_max`).
 
 ## Rules
 
 - **Audio thread:** never allocate, free, lock, log or do I/O inside the cpal callback or in `Engine::next_frame`. Allocate buffers in `Engine::new` (per-channel state is sized by `MAX_CHANNELS`/`MAX_MIXER`). Anything with heap data reaches the engine inside a `Snapshot` and leaves through the trash queue.
 - The test `audio_path_never_allocates_or_frees` counts heap operations on the audio path; keep it passing.
+- `random_edits_keep_the_project_valid` (in `project.rs`) runs hundreds of random edits through the editing operations and checks `validate()`, compiling, saving and undo after each. Add new editing operations to its `random_edit`.
 - **Engine changes need a test** in `engine.rs` (render a few thousand frames and check levels, timing or state). Tests use low sample rates (8–22 kHz) to stay fast.
 - **Project files:** every field in `Project` is saved. If you add, rename or change the meaning of one, bump `file::VERSION`, add an upgrade step to `file::migrate`, and run `cargo test -- --ignored write_fixture` to add the new fixture. Never edit or delete old fixtures: `old_files_still_open` must keep passing.
 - **Chops:** pad `k` (from 0) is pitch `CHOP_BASE + k` (48, `Z`); at most `MAX_SLICES` (16) slices, end to end. Keep chop operations in `project.rs` with tests, like the other edits.

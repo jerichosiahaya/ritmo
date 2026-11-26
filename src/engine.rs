@@ -170,6 +170,9 @@ pub enum Cmd {
     NoteOff { channel: u16, pitch: u8 },
     /// A click on every beat while playing, louder and higher on the first beat of a bar.
     Metronome(bool),
+    /// Where playback starts (and Stop returns to); None: the loop start. While playing, jumps
+    /// there at once.
+    Seek(Option<Tick>),
 }
 
 /// Most commands the UI can queue before the audio thread drains them.
@@ -520,6 +523,8 @@ pub struct Engine {
     peaks: [f32; METERS],
     metronome: bool,
     click: Click,
+    /// Where Play starts: see `start_tick`.
+    cue: Option<Tick>,
 }
 
 /// The metronome's click: a short decaying sine, added after the master chain.
@@ -559,6 +564,7 @@ impl Engine {
             peaks: [0.0; METERS],
             metronome: false,
             click: Click::default(),
+            cue: None,
         }
     }
 
@@ -585,7 +591,8 @@ impl Engine {
                     v.gate = false;
                 }
                 if self.playing {
-                    if !(self.snap.loop_start..self.snap.loop_end).contains(&self.next_tick) {
+                    // Before the loop is fine (playing in from the cue); past its end wraps.
+                    if self.next_tick >= self.snap.loop_end {
                         self.next_tick = self.snap.loop_start;
                         self.wrapped = true;
                     }
@@ -594,7 +601,7 @@ impl Engine {
             }
             Cmd::Play(on) => {
                 self.playing = on;
-                self.next_tick = self.snap.loop_start;
+                self.next_tick = self.start_tick();
                 self.to_next = 0.0;
                 self.wrapped = false;
                 self.seek(self.next_tick);
@@ -602,6 +609,16 @@ impl Engine {
             }
             Cmd::NoteOn { channel, pitch } => self.note_on(channel, pitch, 100, Tick::MAX, true),
             Cmd::Metronome(on) => self.metronome = on,
+            Cmd::Seek(t) => {
+                self.cue = t;
+                if self.playing {
+                    self.next_tick = self.start_tick();
+                    self.to_next = 0.0;
+                    // Release what was playing before the jump, then go on from there.
+                    self.wrapped = true;
+                    self.seek(self.next_tick);
+                }
+            }
             Cmd::NoteOff { channel, pitch } => {
                 for v in self.voices.iter_mut().filter(|v| v.live && v.channel == channel && v.note == pitch) {
                     v.gate = false;
@@ -614,6 +631,12 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Where playback starts: the cue, unless there is none or it is past the loop's end (then
+    /// the loop start). A cue before the loop plays into it.
+    fn start_tick(&self) -> Tick {
+        self.cue.filter(|&t| t < self.snap.loop_end).unwrap_or(self.snap.loop_start)
     }
 
     /// Peak level per meter since the last call, then reset. Index `MASTER` is the master.
@@ -1104,6 +1127,53 @@ mod tests {
         assert!(ticks.windows(2).any(|w| w[1] < w[0]), "never wrapped");
         // The note starts before the loop, so it never plays.
         assert!(e.voices.iter().all(|v| !v.active));
+    }
+
+    #[test]
+    fn play_starts_from_the_cue_and_seek_jumps() {
+        // One note per beat, pitch 60 + beat, over two bars; beats last 0.125 s at 480 BPM.
+        let notes: Vec<SeqNote> = (0..8).map(|b| note(0, 60 + b as u8, b * PPQ, PPQ / 2)).collect();
+        let mut s = snap(&[Instrument::Rhodes], &notes);
+        (s.loop_end, s.bpm) = (8 * PPQ, 480.0);
+        let sr = 8000.0;
+        // The notes the engine has started, in order.
+        let heard = |e: &mut Engine, frames: usize| {
+            let mut got = Vec::new();
+            for _ in 0..frames {
+                e.next_frame();
+                for v in e.voices.iter().filter(|v| v.active && v.gate) {
+                    if got.last() != Some(&v.note) {
+                        got.push(v.note);
+                    }
+                }
+            }
+            got
+        };
+        let mut e = Engine::new(sr);
+        e.handle(Cmd::Snapshot(Box::new(s.clone())));
+        // Stopped: Play starts at the cue (beat 6), plays to the end, wraps to the loop start.
+        e.handle(Cmd::Seek(Some(6 * PPQ)));
+        e.handle(Cmd::Play(true));
+        assert_eq!(heard(&mut e, 3 * 1000), [66, 67, 60]);
+        // Stop and play again: back at the cue.
+        e.handle(Cmd::Play(false));
+        e.handle(Cmd::Play(true));
+        assert_eq!(heard(&mut e, 1000), [66]);
+        // Playing: a seek jumps at once and releases what was held.
+        e.handle(Cmd::Seek(Some(2 * PPQ)));
+        assert!(e.voices.iter().all(|v| !v.gate || v.note == 66));
+        assert_eq!(heard(&mut e, 2 * 1000), [62, 63]);
+        assert!(e.voices.iter().filter(|v| v.gate).all(|v| v.note == 63));
+        // A cue past the end, or none, starts at the loop start; one before the loop plays in.
+        e.handle(Cmd::Seek(Some(99 * PPQ)));
+        assert_eq!(heard(&mut e, 1000), [60]);
+        let mut looped = s.clone();
+        looped.loop_start = 4 * PPQ;
+        e.handle(Cmd::Snapshot(Box::new(looped)));
+        e.handle(Cmd::Seek(None));
+        assert_eq!(heard(&mut e, 1000), [64]);
+        e.handle(Cmd::Seek(Some(2 * PPQ)));
+        assert_eq!(heard(&mut e, 7 * 1000), [62, 63, 64, 65, 66, 67, 64]);
     }
 
     #[test]

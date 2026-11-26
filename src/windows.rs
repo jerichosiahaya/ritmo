@@ -738,9 +738,10 @@ fn playlist(app: &mut App, ui: &mut Ui) {
         let lanes = Rect::from_min_max(Pos2::new(gx, rect.top() + RULER_H), rect.max);
         ui.painter().rect_filled(rect, 0, BG_DEEP);
 
-        // Ruler: click selects a bar, drag sets the loop, double-click clears it.
+        // Ruler: click sets where playback starts (and selects the bar), drag sets the loop,
+        // double-click clears it.
         let ruler = Rect::from_min_max(Pos2::new(gx, rect.top()), Pos2::new(rect.right(), rect.top() + RULER_H));
-        let resp = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag()).on_hover_text("Click: select a bar · drag: loop that part · double-click: clear the loop");
+        let resp = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag()).on_hover_text("Click: play from here (Home: from the start) · drag: loop that part · double-click: clear the loop");
         let snap = |t: f32| (t / unit as f32).round() as Tick * unit;
         if resp.drag_started()
             && let Some(o) = ui.input(|i| i.pointer.press_origin())
@@ -752,12 +753,19 @@ fn playlist(app: &mut App, ui: &mut Ui) {
         } else if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            app.sel_bar = tick_at(pos.x) as Tick / bl;
+            let at = tick_at(pos.x) as Tick / unit * unit;
+            app.sel_bar = at / bl;
+            app.set_cue(Some(at));
         }
         let p = ui.painter();
         if let Some((a, b)) = loop_range {
             let band = Rect::from_min_max(Pos2::new(x(a), ruler.top()), Pos2::new(x(b), ruler.bottom()));
             p.rect_filled(band, 2, ACCENT.gamma_multiply(0.45));
+        }
+        // Where playback starts: a hollow marker under the bar numbers.
+        if let Some(c) = app.cue {
+            let (cx, y) = (x(c), ruler.bottom());
+            p.add(egui::Shape::convex_polygon(vec![Pos2::new(cx - 5.0, y - 8.0), Pos2::new(cx + 5.0, y - 8.0), Pos2::new(cx, y - 1.0)], Color32::TRANSPARENT, Stroke::new(1.5, ACCENT)));
         }
         let label_every = ((40.0 / bar_w).ceil() as Tick).max(1);
         for bar in (0..bars).step_by(label_every as usize) {
@@ -942,7 +950,10 @@ fn playlist(app: &mut App, ui: &mut Ui) {
             if !ui.input(|i| i.pointer.any_down()) {
                 let drag = app.clip_drag.take().expect("checked above");
                 let sel = drop_drag(&mut app.project, &drag, tick_at(pos.x), row_at(pos.y), unit, command);
-                if !matches!(drag, ClipDrag::Loop { .. }) {
+                if matches!(drag, ClipDrag::Loop { .. }) {
+                    // A new loop plays from its start.
+                    app.set_cue(None);
+                } else {
                     app.sel_clips = sel;
                 }
             } else {

@@ -269,6 +269,8 @@ struct App {
     preview: Option<u8>,
     /// Playing tick, if playing.
     cur: Option<Tick>,
+    /// Where playback starts and Stop returns to; None: the start of the loop or song.
+    cue: Option<Tick>,
     /// Decoded chop samples by path (or why they could not be read).
     samples: HashMap<PathBuf, Result<Loaded, String>>,
     /// Bumped whenever a sample arrives, so the engine gets a new snapshot.
@@ -355,6 +357,7 @@ impl App {
             demos: demo_files(),
             preview: None,
             cur: None,
+            cue: None,
             samples: HashMap::new(),
             samples_rev: 0,
             sent_rev: 0,
@@ -382,6 +385,8 @@ impl App {
         self.sel_track = project.tracks.first().map(|t| t.id);
         self.sel_bar = 0;
         (self.sel_clips, self.clip_drag) = (Vec::new(), None);
+        self.cue = None;
+        self.after_send.push(Cmd::Seek(None));
         (self.roll_sel, self.roll_drag) = (Vec::new(), None);
         self.chop_ch = project.channels.iter().find(|c| c.chop.is_some()).map(|c| c.id);
         (self.chop_sel, self.chop_drag) = (0, None);
@@ -474,6 +479,10 @@ impl App {
         let data = loaded.data.clone();
         let name = path.file_stem().map_or("Chop".into(), |s| s.to_string_lossy().into_owned());
         let len = data.frames.len().min(u32::MAX as usize) as u32;
+        if len == 0 {
+            self.status = format!("{} has no audio in it.", path.display());
+            return;
+        }
         let Some(ch) = self.project.add_chop_channel(&name, path.to_path_buf(), len) else {
             self.status = "No room for another channel.".into();
             return;
@@ -835,6 +844,12 @@ impl App {
         self.send(Cmd::Play(on));
     }
 
+    /// Sets where playback starts; while playing, jumps there.
+    fn set_cue(&mut self, cue: Option<Tick>) {
+        self.cue = cue;
+        self.send(Cmd::Seek(cue));
+    }
+
     fn set_metronome(&mut self, on: bool) {
         self.settings.metronome = on;
         self.draft.metronome = on;
@@ -869,6 +884,7 @@ impl App {
         // The new engine starts empty: send it the song and the metronome.
         self.sent = None;
         self.send(Cmd::Metronome(self.settings.metronome));
+        self.after_send.push(Cmd::Seek(self.cue));
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -1093,6 +1109,8 @@ impl App {
                     };
                     self.project.shift_notes(self.roll.0, &self.roll_sel, dt, dp, false);
                 }
+            } else if pressed && key == Key::Home {
+                self.set_cue(None);
             } else if pressed && matches!(key, Key::Minus | Key::Equals) {
                 self.octave = (self.octave + if key == Key::Equals { 1 } else { -1 }).clamp(-3, 3);
                 self.status = format!("Keyboard octave {:+}", self.octave);
@@ -1136,7 +1154,8 @@ impl App {
                 self.set_playing(false);
             }
             let bl = self.project.bar_len();
-            let (bar, step) = self.cur.map_or((1, 1), |t| (t / bl + 1, t % bl / STEP + 1));
+            // Stopped: where playback will start.
+            let (bar, step) = self.cur.or(self.cue).map_or((1, 1), |t| (t / bl + 1, t % bl / STEP + 1));
             lcd(ui, &format!("{bar}:{step:02}"), &format!("{:.0} BPM\nBAR:STEP", self.project.bpm));
             ui.add(egui::DragValue::new(&mut self.project.bpm).range(50.0..=180.0).speed(0.5).suffix(" bpm")).on_hover_text("Tempo: drag or type");
             if ui.add(egui::Button::selectable(self.settings.metronome, "♩ Click")).on_hover_text("Metronome: a click on every beat while playing (not exported)").clicked() {
