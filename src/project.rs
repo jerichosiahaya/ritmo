@@ -10,7 +10,7 @@
 
 use crate::engine::{ChannelMix, ChopMix, FX_NEUTRAL, Fx, MAX_CHANNELS, MAX_MIXER, MixerMix, SampleData, SeqNote, SliceMix, Snapshot, pan_gains};
 pub use crate::engine::{CHOP_BASE, MAX_SLICES};
-pub use crate::engine::{Instrument, PPQ, STEP, Tick};
+pub use crate::engine::{Instrument, PPQ, STEP, Sends, Sound, Tick, TrackFx};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -75,6 +75,10 @@ pub struct Channel {
     pub pan: f32,
     pub mute: bool,
     pub mixer: MixerId,
+    /// Pitch, tone, envelope, and the synth's settings (format 4; older files get the defaults,
+    /// which leave their sound as it was).
+    #[serde(default)]
+    pub sound: Sound,
     /// The sample and slices of an `Instrument::Chop` channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chop: Option<Chop>,
@@ -113,6 +117,9 @@ pub struct MixerTrack {
     pub vol: f32,
     pub pan: f32,
     pub mute: bool,
+    /// EQ, filter and sends (format 4; older files get none).
+    #[serde(default)]
+    pub fx: TrackFx,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
@@ -180,6 +187,9 @@ pub struct Project {
     pub clips: Vec<Clip>,
     /// Playback loops over `start..end` when set.
     pub loop_range: Option<(Tick, Tick)>,
+    /// The delay and reverb the mixer tracks send to (format 4).
+    #[serde(default)]
+    pub sends: Sends,
     /// Last ID handed out.
     next_id: u32,
 }
@@ -198,6 +208,7 @@ impl Default for Project {
             tracks: Vec::new(),
             clips: Vec::new(),
             loop_range: None,
+            sends: Sends::default(),
             next_id: 0,
         }
     }
@@ -230,7 +241,7 @@ impl Project {
             return None;
         }
         let id = MixerId(self.fresh_id());
-        self.mixer.push(MixerTrack { id, name: name.into(), vol: 0.8, pan: 0.0, mute: false });
+        self.mixer.push(MixerTrack { id, name: name.into(), vol: 0.8, pan: 0.0, mute: false, fx: TrackFx::default() });
         Some(id)
     }
 
@@ -241,7 +252,7 @@ impl Project {
             return None;
         }
         let id = ChannelId(self.fresh_id());
-        self.channels.push(Channel { id, name: name.into(), instrument, vol: 0.8, pan: 0.0, mute: false, mixer, chop: None });
+        self.channels.push(Channel { id, name: name.into(), instrument, vol: 0.8, pan: 0.0, mute: false, mixer, sound: Sound::default(), chop: None });
         Some(id)
     }
 
@@ -355,6 +366,7 @@ impl Project {
             .take(MAX_CHANNELS)
             .map(|c| ChannelMix {
                 instrument: c.instrument,
+                sound: c.sound,
                 gain: gains(c.vol, c.pan),
                 mute: c.mute,
                 mixer: self.mixer.iter().take(MAX_MIXER).position(|m| m.id == c.mixer).unwrap_or(0),
@@ -365,7 +377,7 @@ impl Project {
                 }),
             })
             .collect();
-        let mixer = self.mixer.iter().take(MAX_MIXER).map(|m| MixerMix { gain: gains(m.vol, m.pan), mute: m.mute }).collect();
+        let mixer = self.mixer.iter().take(MAX_MIXER).map(|m| MixerMix { gain: gains(m.vol, m.pan), mute: m.mute, fx: m.fx }).collect();
         let index = |id: ChannelId| self.channels.iter().take(MAX_CHANNELS).position(|c| c.id == id);
 
         let mut notes = Vec::new();
@@ -382,7 +394,7 @@ impl Project {
         notes.sort_by_key(|n| (n.start, n.channel, n.pitch));
 
         let (loop_start, loop_end) = self.loop_range.unwrap_or(self.song_range());
-        Snapshot { bpm: self.bpm, swing: self.swing, fx: self.master, channels, mixer, notes, chops, loop_start, loop_end, bar: self.bar_len() }
+        Snapshot { bpm: self.bpm, swing: self.swing, fx: self.master, channels, mixer, notes, chops, loop_start, loop_end, bar: self.bar_len(), sends: self.sends }
     }
 
     /// Checks every invariant: unique IDs no higher than the counter, references that resolve,
@@ -417,9 +429,15 @@ impl Project {
                 return Err(format!("ID {id} is used twice"));
             }
         }
+        if !self.sends.is_valid() || self.mixer.iter().any(|m| !m.fx.is_valid()) {
+            return Err("mixer effects out of range".into());
+        }
         for c in &self.channels {
             if self.mixer_track(c.mixer).is_none() {
                 return Err(format!("channel {:?} routes to missing mixer track {:?}", c.name, c.mixer));
+            }
+            if !c.sound.is_valid() {
+                return Err(format!("channel {:?} has sound settings out of range", c.name));
             }
             if c.chop.is_some() != (c.instrument == Instrument::Chop) {
                 return Err(format!("channel {:?}: only chop channels have chop settings, and every chop channel has them", c.name));
@@ -914,6 +932,37 @@ impl Project {
         let ids = notes.iter().filter_map(|n| self.draw_note(pattern, channel, n.pitch, at + n.start - first, n.len, n.vel)).collect();
         self.fit_pattern(pattern);
         ids
+    }
+}
+
+/// Adding instruments.
+impl Project {
+    /// The name the Channel Rack shows for a new channel of `instrument`.
+    pub fn instrument_name(instrument: Instrument) -> &'static str {
+        match instrument {
+            Instrument::Kick => "Kick",
+            Instrument::Snare => "Snare",
+            Instrument::Hat => "Hat",
+            Instrument::Rhodes => "Keys",
+            Instrument::Bass => "Bass",
+            Instrument::Synth => "Synth",
+            Instrument::Chop => "Chop",
+        }
+    }
+
+    /// A new channel of a built-in instrument ("Synth", then "Synth 2", …). Drums go to the
+    /// "Drums" mixer track if there is one; anything else gets a mixer track of its own while
+    /// there is room, else shares the first. None if the rack is full.
+    pub fn add_instrument(&mut self, instrument: Instrument) -> Option<ChannelId> {
+        let base = Self::instrument_name(instrument);
+        let names = std::iter::once(base.to_string()).chain((2..).map(|n| format!("{base} {n}")));
+        let name = Self::free_name(names, self.channels.iter().map(|c| c.name.as_str()));
+        let drums = self.mixer.iter().find(|m| m.name == "Drums").map(|m| m.id).filter(|_| instrument.is_drum());
+        let mixer = match drums {
+            Some(m) => m,
+            None => self.add_mixer_track(&name).or(self.mixer.first().map(|m| m.id)).or_else(|| self.add_mixer_track("Main"))?,
+        };
+        self.add_channel(&name, instrument, mixer)
     }
 }
 
@@ -1430,7 +1479,7 @@ mod tests {
         let some_notes: Vec<NoteId> = notes.iter().copied().filter(|_| r.below(3) == 0).collect();
         let some_clips: Vec<ClipId> = clips.iter().copied().filter(|_| r.below(3) == 0).collect();
         let span = 8 * BAR;
-        match r.below(26) {
+        match r.below(29) {
             0 => {
                 let step = r.tick(64);
                 p.toggle_step(pat, ch, step);
@@ -1563,6 +1612,25 @@ mod tests {
                 let id = p.new_pattern();
                 format!("new_pattern {id:?}")
             }
+            24 => {
+                let inst = [Instrument::Kick, Instrument::Snare, Instrument::Hat, Instrument::Rhodes, Instrument::Bass, Instrument::Synth][r.below(6) as usize];
+                let id = p.add_instrument(inst);
+                format!("add_instrument {inst:?} -> {id:?}")
+            }
+            26 => {
+                let x = |r: &mut Rng| r.below(1001) as f32 / 1000.0;
+                if let Some(m) = p.mixer.get_mut(r.below(16) as usize) {
+                    m.fx = TrackFx { low: 24.0 * x(r) - 12.0, mid: 24.0 * x(r) - 12.0, high: 24.0 * x(r) - 12.0, filter: 2.0 * x(r) - 1.0, delay: x(r), reverb: x(r) };
+                }
+                p.sends = Sends { delay_steps: 1.0 + r.below(16) as f32, feedback: 0.9 * x(r), size: x(r), damping: x(r) };
+                "mixer fx".into()
+            }
+            25 => {
+                let Some(c) = p.channels.iter_mut().find(|c| c.id == ch) else { return "no channel".into() };
+                let x = |r: &mut Rng| r.below(1001) as f32 / 1000.0;
+                c.sound = Sound { pitch: r.signed(24) as f32, tone: x(r), attack: 2.0 * x(r), release: 0.1 + 3.9 * x(r), wave: x(r), detune: 50.0 * x(r), cutoff: x(r), resonance: x(r), envelope: x(r), decay: 0.01 + 3.99 * x(r), sustain: x(r) };
+                format!("sound {ch:?}")
+            }
             _ => {
                 let (bar, chord) = (r.tick(4), r.below(CHORDS.len() as u64) as usize);
                 p.stamp_chord(pat, bar * BAR, BAR, chord);
@@ -1612,6 +1680,31 @@ mod tests {
             while history.redo(&mut p) {}
             assert!(p == end, "seed {seed}: redo did not return to the end");
         }
+    }
+
+    #[test]
+    fn adding_instruments() {
+        let mut p = Project::demo();
+        let mixers = p.mixer.len();
+        let synth = p.add_instrument(Instrument::Synth).unwrap();
+        let synth2 = p.add_instrument(Instrument::Synth).unwrap();
+        let kick = p.add_instrument(Instrument::Kick).unwrap();
+        let names: Vec<&str> = [synth, synth2, kick].iter().map(|&c| p.channel(c).unwrap().name.as_str()).collect();
+        assert_eq!(names, ["Synth", "Synth 2", "Kick 2"]);
+        // Each melodic one gets a mixer track named after it; drums join "Drums".
+        assert_eq!(p.mixer.len(), mixers + 2);
+        assert_eq!(p.mixer_track(p.channel(synth2).unwrap().mixer).unwrap().name, "Synth 2");
+        assert_eq!(p.mixer_track(p.channel(kick).unwrap().mixer).unwrap().name, "Drums");
+        // With the mixer full, new channels share the first track; with the rack full, none.
+        while p.add_mixer_track("x").is_some() {}
+        let late = p.add_instrument(Instrument::Bass).unwrap();
+        assert_eq!(p.channel(late).unwrap().mixer, p.mixer[0].id);
+        while p.add_instrument(Instrument::Hat).is_some() {}
+        assert_eq!(p.channels.len(), MAX_CHANNELS);
+        p.validate().unwrap();
+        // A blank project without a mixer still gets one.
+        let mut q = Project::default();
+        assert!(q.add_instrument(Instrument::Synth).is_some() && q.mixer.len() == 1);
     }
 
     #[test]

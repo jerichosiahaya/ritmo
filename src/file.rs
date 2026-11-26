@@ -16,7 +16,7 @@ const FORMAT: &str = "ritmo";
 /// File format version this build writes. When a saved field changes shape or meaning: bump it,
 /// add an upgrade step to `migrate`, and run `cargo test -- --ignored write_fixture` to add a
 /// fixture under `tests/files/` that every later version must keep opening.
-pub const VERSION: u64 = 3;
+pub const VERSION: u64 = 4;
 
 #[derive(Debug)]
 pub enum FileError {
@@ -78,6 +78,10 @@ pub fn from_str(text: &str) -> Result<Project, FileError> {
 /// - 2 → 3: a clip longer than the rest of its pattern repeats the pattern; before, it went
 ///   silent there. Older clips are cut where they went silent, so they sound the same, and
 ///   clips that started past their pattern's end (silent throughout) are dropped.
+/// - 3 → 4: channels gained `sound` (pitch, tone, envelope, synth settings), mixer tracks `fx`
+///   (EQ, filter, sends) and the project `sends` (delay and reverb), and there is a Synth
+///   instrument. Missing fields take defaults that leave the sound as it was, so nothing needs
+///   rewriting.
 fn migrate(doc: &mut Value, from: u64) -> Result<(), FileError> {
     if from < 1 {
         return Err(FileError::Broken(format!("unknown file format {from}")));
@@ -162,8 +166,9 @@ mod tests {
 
     const BAR: crate::project::Tick = 4 * PPQ;
 
-    /// The demo plus a chop channel (its audio file need not exist) playing pad 2, and (from
-    /// format 3) a clip that repeats its one-bar pattern for four bars from its second beat.
+    /// The demo plus a chop channel (its audio file need not exist) playing pad 2, (from
+    /// format 3) a clip that repeats its one-bar pattern for four bars from its second beat, and
+    /// (from format 4) a synth with its own sound, a darker bass, EQ and sends on the mixer.
     fn with_chops() -> Project {
         let mut p = Project::demo();
         let ch = p.add_chop_channel("Break", PathBuf::from("samples/break.wav"), 88200).unwrap();
@@ -174,11 +179,18 @@ mod tests {
         p.add_note(beat, ch, CHOP_BASE + 1, 0, STEP, 100);
         let long = p.add_track("Long");
         p.add_clip_at(long, beat, 4 * BAR + PPQ, 4 * BAR, PPQ);
+        let synth = p.add_instrument(crate::engine::Instrument::Synth).unwrap();
+        p.add_note(beat, synth, 57, 0, PPQ, 90);
+        let sound = crate::project::Sound { wave: 1.0, cutoff: 0.3, attack: 0.05, ..Default::default() };
+        p.channels.iter_mut().find(|c| c.id == synth).unwrap().sound = sound;
+        p.channels.iter_mut().find(|c| c.name == "Bass").unwrap().sound.tone = 0.4;
+        p.mixer[0].fx = crate::project::TrackFx { low: 3.0, high: -2.0, filter: 0.2, delay: 0.3, reverb: 0.5, ..Default::default() };
+        p.sends.delay_steps = 4.0;
         p
     }
 
     /// Fixture names after the format number: what that format added.
-    const FIXTURE: &str = "loops";
+    const FIXTURE: &str = "sound";
 
     fn fixtures() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/files")
@@ -305,6 +317,14 @@ mod tests {
         // Four bars from beat 2 play each once per bar, beat 1's last.
         let starts: Vec<_> = v3.clip_notes(*long).map(|(t, _)| t).collect();
         assert_eq!((starts.len(), starts.iter().filter(|&&t| t >= 4 * BAR - PPQ).count()), (4 * 14, 4));
+        // Format 4: a synth, sound settings, mixer effects and sends. Older files get the
+        // defaults, which change nothing.
+        let v4 = load(&fixtures().join("format-4-sound.ritmo")).unwrap();
+        let synth = v4.channels.iter().find(|c| c.instrument == crate::engine::Instrument::Synth).unwrap();
+        assert_eq!((synth.sound.wave, synth.sound.cutoff), (1.0, 0.3));
+        assert_eq!((v4.mixer[0].fx.reverb, v4.sends.delay_steps), (0.5, 4.0));
+        assert!(v3.channels.iter().all(|c| c.sound == crate::project::Sound::default()));
+        assert!(v3.mixer.iter().all(|m| m.fx == crate::project::TrackFx::default()) && v3.sends == crate::project::Sends::default());
     }
 
     /// Format 2 clips went silent past their pattern's end; opened now, they are cut there.
@@ -327,7 +347,7 @@ mod tests {
     #[ignore = "writes tests/files/format-<VERSION>-<FIXTURE>.ritmo"]
     fn write_fixture() {
         // Version 1's fixture is format-1-demo.ritmo (the demo song alone), version 2's
-        // format-2-chops.ritmo.
+        // format-2-chops.ritmo, version 3's format-3-loops.ritmo.
         let path = fixtures().join(format!("format-{VERSION}-{FIXTURE}.{EXTENSION}"));
         fs::create_dir_all(fixtures()).unwrap();
         save(&path, &with_chops()).unwrap();

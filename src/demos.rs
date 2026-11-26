@@ -7,7 +7,7 @@ use crate::engine::{self, Fx, STEP, SampleData, Tick};
 use std::sync::Arc;
 use crate::file;
 use crate::engine::Instrument;
-use crate::project::{CHOP_BASE, CHORDS, ChannelId, DEFAULT_VEL, MAX_SLICES, PatternId, Project};
+use crate::project::{CHOP_BASE, CHORDS, ChannelId, DEFAULT_VEL, MAX_SLICES, PatternId, Project, Sends, Sound, TrackFx};
 use crate::sample;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,6 +90,19 @@ fn boom_bap(data: &SampleData) -> Project {
         p.add_note(line, bass, pitch, step * STEP, len * STEP, DEFAULT_VEL);
     }
 
+    // A small room on the chops, a rounder bass, weightier drums.
+    p.sends = Sends { size: 0.35, damping: 0.6, ..Sends::default() };
+    for m in &mut p.mixer {
+        m.fx = match m.name.as_str() {
+            "Chops" => TrackFx { reverb: 0.25, low: -2.0, ..TrackFx::default() },
+            "Drums" => TrackFx { low: 3.0, ..TrackFx::default() },
+            _ => TrackFx::default(),
+        };
+    }
+    if let Some(c) = p.channels.iter_mut().find(|c| c.id == bass) {
+        c.sound.tone = 0.55;
+    }
+
     let names = ["Chops", "Drums", "Bass"];
     for (t, name) in p.tracks.iter_mut().zip(names) {
         t.name = name.into();
@@ -133,9 +146,25 @@ fn house() -> Project {
             p.add_note(line, bass, CHORDS[c].bass, at + step * STEP, 2 * STEP, DEFAULT_VEL);
         }
     }
+    // The lead is a synth: a detuned saw with a filter that opens on each note, echoing.
+    if let Some(c) = p.channels.iter_mut().find(|c| c.id == lead) {
+        c.instrument = Instrument::Synth;
+        c.vol = 0.5;
+        c.sound = Sound { cutoff: 0.4, resonance: 0.35, envelope: 0.6, decay: 0.35, sustain: 0.5, detune: 18.0, release: 1.5, ..Sound::default() };
+    }
     let melody = p.add_pattern("Lead", 4 * bar);
     for (pitch, step, len) in [(76, 0, 4), (74, 6, 2), (72, 8, 6), (72, 16, 4), (69, 22, 2), (72, 24, 8), (76, 32, 4), (79, 38, 2), (76, 40, 6), (74, 48, 6), (71, 56, 8)] {
         p.add_note(melody, lead, pitch, step * STEP, len * STEP, DEFAULT_VEL);
+    }
+    // Mixer: the lead echoes on dotted 8ths, the stabs sit in a room, the drums get some weight.
+    p.sends = Sends { delay_steps: 3.0, feedback: 0.35, size: 0.55, damping: 0.45 };
+    for m in &mut p.mixer {
+        m.fx = match m.name.as_str() {
+            "Lead" => TrackFx { delay: 0.35, reverb: 0.3, high: 1.5, ..TrackFx::default() },
+            "Keys" => TrackFx { reverb: 0.3, low: -3.0, ..TrackFx::default() },
+            "Drums" => TrackFx { low: 2.0, reverb: 0.08, ..TrackFx::default() },
+            _ => TrackFx::default(),
+        };
     }
 
     let names = ["Drums", "Keys", "Bass"];
@@ -196,7 +225,7 @@ fn demos_open() {
         let snap = p.compile_with(&|path| samples.iter().find(|(p, _)| p == path).map(|(_, d)| d.clone()));
         assert!(snap.notes.len() > 20, "{}", path.display());
         let peak = engine::render_offline(&snap, 8000, 1).iter().fold(0f32, |m, f| m.max(f[0].abs()).max(f[1].abs()));
-        assert!((0.2..1.0).contains(&peak), "{}: peak {peak}", path.display());
+        assert!((0.2..0.98).contains(&peak), "{}: peak {peak}", path.display());
         seen += 1;
     }
     assert_eq!(seen, 3);
@@ -243,3 +272,4 @@ fn render_speed() {
     let took = start.elapsed().as_secs_f64();
     println!("worst case ({} channels, {} notes): {:.0}x real time", snap.channels.len(), snap.notes.len(), frames as f64 / 44100.0 / took);
 }
+

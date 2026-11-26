@@ -23,7 +23,9 @@
       <li>Patterns, a free-form playlist with looping clips, and a loop range</li>
       <li>Piano roll with note length, velocity, selection, copy and paste</li>
       <li>Chop sampler for WAV, FLAC, MP3, OGG and AIFF files</li>
-      <li>Mixer with meters, metronome, undo and redo for every edit</li>
+      <li>A synth, and pitch, tone and envelope on every instrument</li>
+      <li>Mixer with EQ, filter, delay and reverb sends, and meters</li>
+      <li>Metronome, undo and redo for every edit</li>
       <li>Projects saved as readable files, with autosave; export to WAV</li>
     </ul>
   </description>
@@ -43,7 +45,8 @@
     <release version="0.2.0" date="2027-01-31">
       <description>
         <p>First public release: projects and autosave, undo, the chop sampler, a free-form
-        playlist, piano-roll editing, metronome and audio settings.</p>
+        playlist, piano-roll editing, a synth and sound controls, mixer effects, metronome and
+        audio settings.</p>
       </description>
     </release>
   </releases>

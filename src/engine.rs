@@ -44,6 +44,7 @@ pub const MASTER: usize = MAX_MIXER;
 pub const METERS: usize = MAX_MIXER + 1;
 const VOICES: usize = 32;
 const CHOP_VOICES: usize = 32;
+const SYNTH_VOICES: usize = 32;
 /// Chop pads: pad `k` (from 0) plays at pitch `CHOP_BASE + k`, so pad 1 is C3 (`Z` on the
 /// typing keyboard).
 pub const CHOP_BASE: u8 = 48;
@@ -62,6 +63,8 @@ pub enum Instrument {
     Bass,
     /// Chop sampler: plays slices of an audio file, one per pad.
     Chop,
+    /// Subtractive synth: two oscillators, a resonant low-pass filter and an envelope.
+    Synth,
 }
 
 impl Instrument {
@@ -70,9 +73,62 @@ impl Instrument {
     }
 }
 
+/// How a channel sounds. Pitch, tone, attack and release work on every instrument; the rest
+/// shape the synth. The defaults leave every other instrument as it was.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sound {
+    /// Semitones, -24..24. Drums are tuned by it; a chop channel moves all its pads.
+    pub pitch: f32,
+    /// Low-pass on the channel, 0..1: 1 is open, 0 is 150 Hz.
+    pub tone: f32,
+    /// Seconds to fade in, 0..2. 0 keeps the instrument's own quick, click-free start.
+    pub attack: f32,
+    /// How long notes ring after they end (drums: how long hits ring), times the instrument's
+    /// own, 0.1..4.
+    pub release: f32,
+    /// Synth: oscillator shape, 0 saw .. 1 square.
+    pub wave: f32,
+    /// Synth: the second oscillator's detune in cents, 0..50.
+    pub detune: f32,
+    /// Synth: filter cutoff (0..1: 40 Hz .. 20 kHz), resonance (0..1) and how far the
+    /// envelope opens the filter (0..1).
+    pub cutoff: f32,
+    pub resonance: f32,
+    pub envelope: f32,
+    /// Synth: seconds to decay to the sustain level (0.01..4), and that level (0..1).
+    pub decay: f32,
+    pub sustain: f32,
+}
+
+impl Default for Sound {
+    fn default() -> Self {
+        Sound { pitch: 0.0, tone: 1.0, attack: 0.0, release: 1.0, wave: 0.0, detune: 12.0, cutoff: 0.55, resonance: 0.25, envelope: 0.45, decay: 0.4, sustain: 0.6 }
+    }
+}
+
+impl Sound {
+    /// Whether every value is in its range (for checking loaded projects).
+    pub fn is_valid(&self) -> bool {
+        let r = |v: f32, lo: f32, hi: f32| v.is_finite() && (lo..=hi).contains(&v);
+        r(self.pitch, -24.0, 24.0)
+            && r(self.tone, 0.0, 1.0)
+            && r(self.attack, 0.0, 2.0)
+            && r(self.release, 0.1, 4.0)
+            && r(self.wave, 0.0, 1.0)
+            && r(self.detune, 0.0, 50.0)
+            && r(self.cutoff, 0.0, 1.0)
+            && r(self.resonance, 0.0, 1.0)
+            && r(self.envelope, 0.0, 1.0)
+            && r(self.decay, 0.01, 4.0)
+            && r(self.sustain, 0.0, 1.0)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ChannelMix {
     pub instrument: Instrument,
+    pub sound: Sound,
     /// Volume and pan as left/right gains.
     pub gain: [f32; 2],
     pub mute: bool,
@@ -123,6 +179,56 @@ pub struct ChopMix {
 pub struct MixerMix {
     pub gain: [f32; 2],
     pub mute: bool,
+    pub fx: TrackFx,
+}
+
+/// A mixer track's effects. The defaults leave the track untouched.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrackFx {
+    /// EQ in dB, -12..12: a low shelf at 200 Hz, a bell at 1 kHz, a high shelf at 5 kHz.
+    pub low: f32,
+    pub mid: f32,
+    pub high: f32,
+    /// One-knob filter, -1..1: 0 is off; left cuts the highs (down to 150 Hz), right cuts the
+    /// lows (up to 5 kHz).
+    pub filter: f32,
+    /// How much goes to the shared delay and reverb, 0..1.
+    pub delay: f32,
+    pub reverb: f32,
+}
+
+impl TrackFx {
+    pub fn is_valid(&self) -> bool {
+        let r = |v: f32, lo: f32, hi: f32| v.is_finite() && (lo..=hi).contains(&v);
+        r(self.low, -12.0, 12.0) && r(self.mid, -12.0, 12.0) && r(self.high, -12.0, 12.0) && r(self.filter, -1.0, 1.0) && r(self.delay, 0.0, 1.0) && r(self.reverb, 0.0, 1.0)
+    }
+}
+
+/// The delay and reverb every mixer track can send to.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sends {
+    /// Delay time in 16ths, 1..16 (3 is a dotted 8th); echoes bounce left and right.
+    pub delay_steps: f32,
+    /// How much of each echo comes back, 0..0.9.
+    pub feedback: f32,
+    /// Reverb room size and how dark its tail is, 0..1.
+    pub size: f32,
+    pub damping: f32,
+}
+
+impl Default for Sends {
+    fn default() -> Self {
+        Sends { delay_steps: 3.0, feedback: 0.4, size: 0.6, damping: 0.4 }
+    }
+}
+
+impl Sends {
+    pub fn is_valid(&self) -> bool {
+        let r = |v: f32, lo: f32, hi: f32| v.is_finite() && (lo..=hi).contains(&v);
+        r(self.delay_steps, 1.0, 16.0) && r(self.feedback, 0.0, 0.9) && r(self.size, 0.0, 1.0) && r(self.damping, 0.0, 1.0)
+    }
 }
 
 /// A note placed in song time.
@@ -154,11 +260,12 @@ pub struct Snapshot {
     pub loop_end: Tick,
     /// Length of a bar; the metronome accents its first beat.
     pub bar: Tick,
+    pub sends: Sends,
 }
 
 impl Default for Snapshot {
     fn default() -> Self {
-        Snapshot { bpm: 120.0, swing: 0.5, fx: FX_NEUTRAL, channels: Vec::new(), mixer: Vec::new(), notes: Vec::new(), chops: Vec::new(), loop_start: 0, loop_end: 4 * PPQ, bar: 4 * PPQ }
+        Snapshot { bpm: 120.0, swing: 0.5, fx: FX_NEUTRAL, channels: Vec::new(), mixer: Vec::new(), notes: Vec::new(), chops: Vec::new(), loop_start: 0, loop_end: 4 * PPQ, bar: 4 * PPQ, sends: Sends::default() }
     }
 }
 
@@ -244,8 +351,9 @@ struct Voice {
 
 impl Voice {
     /// 2-operator FM electric piano with a short 14:1 "tine" partial on the attack.
-    fn tick(&mut self, dt: f32, rel_coef: f32) -> f32 {
-        let env = (-self.t * 1.3).exp() * self.rel * (self.t * 400.0).min(1.0);
+    fn tick(&mut self, dt: f32, k: &ChanCoefs) -> f32 {
+        let (rel_coef, attack) = (k.release, k.attack.max(1.0 / 400.0));
+        let env = (-self.t * 1.3).exp() * self.rel * (self.t / attack).min(1.0);
         if !self.gate {
             self.rel *= rel_coef;
         }
@@ -288,6 +396,8 @@ struct ChopVoice {
     t: f32,
     /// Fading out after note-off or a cut, per output frame.
     release: f32,
+    /// Fade-in, seconds.
+    attack: f32,
 }
 
 impl ChopVoice {
@@ -301,7 +411,7 @@ impl ChopVoice {
         }
         // 2 ms fade in, and fade out over the last 3 ms of the slice, so chops never click.
         let edge = (remaining / self.step.abs() * dt as f64 / 0.003).min(1.0) as f32;
-        let fade_in = (self.t / 0.002).min(1.0);
+        let fade_in = (self.t / self.attack.max(0.002)).min(1.0);
         if self.release > 0.0 {
             self.env *= self.release;
         }
@@ -312,6 +422,123 @@ impl ChopVoice {
         self.pos += self.step;
         self.t += dt;
         [(a[0] + (b[0] - a[0]) * frac) * g, (a[1] + (b[1] - a[1]) * frac) * g]
+    }
+}
+
+/// A channel's `Sound` as per-sample numbers, worked out when a snapshot arrives so the audio
+/// path only multiplies.
+#[derive(Clone, Copy)]
+struct ChanCoefs {
+    /// Frequency ratio from the pitch setting.
+    ratio: f32,
+    /// One-pole coefficient of the tone low-pass (1 passes everything).
+    tone: f32,
+    /// Fade-in, seconds.
+    attack: f32,
+    /// Per-sample multiplier of a released note's level (for the channel's instrument).
+    release: f32,
+    /// Drums: how much longer hits ring.
+    ring: f32,
+    /// Synth: per-sample multipliers toward the sustain level and of the filter envelope; the
+    /// filter's base cutoff (Hz), how many octaves the envelope opens it, its damping, the second
+    /// oscillator's frequency ratio.
+    decay: f32,
+    cutoff: f32,
+    env_octaves: f32,
+    damping: f32,
+    detune: f32,
+}
+
+impl ChanCoefs {
+    fn new(s: &Sound, inst: Instrument, sr: f32) -> Self {
+        let per_sample = |secs: f32| (-1.0 / (secs.max(1e-4) * sr)).exp();
+        // How long each instrument's notes ring after they end, before the release setting.
+        let base = match inst {
+            Instrument::Chop => 0.01,
+            Instrument::Synth => 0.3,
+            _ => 0.25,
+        };
+        let fc = 150.0 * (20000.0f32 / 150.0).powf(s.tone);
+        ChanCoefs {
+            ratio: 2f32.powf(s.pitch / 12.0),
+            tone: if s.tone >= 0.999 { 1.0 } else { 1.0 - (-TAU * fc / sr).exp() },
+            attack: s.attack,
+            release: per_sample(base * s.release),
+            ring: s.release,
+            decay: per_sample(s.decay / 4.0),
+            cutoff: 40.0 * 500f32.powf(s.cutoff),
+            env_octaves: s.envelope * 7.0,
+            damping: 2.0 - 1.9 * s.resonance,
+            detune: 2f32.powf(s.detune / 1200.0),
+        }
+    }
+}
+
+/// A smoothed step for a band-limited oscillator edge at phase 0 (PolyBLEP).
+fn blep(ph: f32, inc: f32) -> f32 {
+    if ph < inc {
+        let x = ph / inc;
+        2.0 * x - x * x - 1.0
+    } else if ph > 1.0 - inc {
+        let x = (ph - 1.0) / inc;
+        x * x + 2.0 * x + 1.0
+    } else {
+        0.0
+    }
+}
+
+/// One synth note: two oscillators (saw to square), a resonant low-pass whose envelope opens it
+/// at the start of the note, and an attack-decay-sustain-release level.
+#[derive(Clone, Copy, Default)]
+struct SynthVoice {
+    active: bool,
+    gate: bool,
+    live: bool,
+    channel: u16,
+    note: u8,
+    end: Tick,
+    freq: f32,
+    vel: f32,
+    t: f32,
+    level: f32,
+    /// The filter envelope, from 1 down to 0.
+    fenv: f32,
+    ph: [f32; 2],
+    /// Filter state (two integrators).
+    ic: [f32; 2],
+}
+
+impl SynthVoice {
+    fn tick(&mut self, s: &Sound, k: &ChanCoefs, dt: f32, sr: f32) -> f32 {
+        let attack = k.attack.max(0.002);
+        if !self.gate {
+            self.level *= k.release;
+            if self.level < 1e-4 {
+                self.active = false;
+                return 0.0;
+            }
+        } else if self.t < attack {
+            self.level = self.level.max(self.t / attack);
+        } else {
+            self.level = s.sustain + (self.level - s.sustain) * k.decay;
+        }
+        let osc = |ph: f32, inc: f32| {
+            let saw = 2.0 * ph - 1.0 - blep(ph, inc);
+            let square = (if ph < 0.5 { 1.0 } else { -1.0 }) + blep(ph, inc) - blep((ph + 0.5).fract(), inc);
+            saw + (square - saw) * s.wave
+        };
+        let inc = [self.freq * dt, self.freq * k.detune * dt];
+        let x = 0.5 * (osc(self.ph[0], inc[0]) + osc(self.ph[1], inc[1]));
+        self.ph = [(self.ph[0] + inc[0]).fract(), (self.ph[1] + inc[1]).fract()];
+        // State-variable low-pass (topology-preserving), cutoff swept by the envelope.
+        let fc = (k.cutoff * 2f32.powf(k.env_octaves * self.fenv)).min(0.45 * sr);
+        let g = (std::f32::consts::PI * fc * dt).tan();
+        let v1 = (self.ic[0] + g * (x - self.ic[1])) / (1.0 + g * (g + k.damping));
+        let v2 = self.ic[1] + g * v1;
+        self.ic = [2.0 * v1 - self.ic[0], 2.0 * v2 - self.ic[1]];
+        self.fenv *= k.decay;
+        self.t += dt;
+        v2 * self.level * self.vel * 0.3
     }
 }
 
@@ -343,28 +570,29 @@ impl Default for ChanState {
 }
 
 impl ChanState {
-    fn render(&mut self, inst: Instrument, dt: f32, rel_coef: f32, rng: &mut Rng) -> f32 {
-        let t = self.hit_t;
+    fn render(&mut self, inst: Instrument, dt: f32, k: &ChanCoefs, rng: &mut Rng) -> f32 {
+        // Drums: `release` stretches how long a hit rings, `ratio` tunes it.
+        let (t, ring, ratio) = (self.hit_t, k.ring, k.ratio);
         let out = match inst {
-            Instrument::Kick if t < 0.6 => {
-                let f = 45.0 + 110.0 * (-t * 35.0).exp();
+            Instrument::Kick if t < 0.6 * ring => {
+                let f = (45.0 + 110.0 * (-t * 35.0).exp()) * ratio;
                 self.ph = (self.ph + f * dt).fract();
-                (TAU * self.ph).sin() * (-t * 7.0).exp() * 0.72 * self.hit_vel
+                (TAU * self.ph).sin() * (-t * 7.0 / ring).exp() * 0.72 * self.hit_vel
             }
-            Instrument::Snare if t < 0.4 => (rng.next() * 0.4 * (-t * 22.0).exp() + (TAU * 185.0 * t).sin() * 0.35 * (-t * 35.0).exp()) * 0.8 * self.hit_vel,
+            Instrument::Snare if t < 0.4 * ring => (rng.next() * 0.4 * (-t * 22.0 / ring).exp() + (TAU * 185.0 * ratio * t).sin() * 0.35 * (-t * 35.0 / ring).exp()) * 0.8 * self.hit_vel,
             Instrument::Hat => {
                 let n = rng.next();
-                self.lp += 0.35 * (n - self.lp);
-                if t < 0.15 { (n - self.lp) * 0.18 * (-t * 70.0).exp() * self.hit_vel } else { 0.0 }
+                self.lp += (0.35 / ratio).min(0.95) * (n - self.lp);
+                if t < 0.15 * ring { (n - self.lp) * 0.18 * (-t * 70.0 / ring).exp() * self.hit_vel } else { 0.0 }
             }
             Instrument::Bass => {
                 if !self.gate {
-                    self.amp *= rel_coef;
+                    self.amp *= k.release;
                 }
                 if self.amp < 1e-4 {
                     return 0.0;
                 }
-                let env = (self.t * 200.0).min(1.0) * (0.55 + 0.45 * (-self.t * 2.0).exp()) * self.amp;
+                let env = (self.t / k.attack.max(0.005)).min(1.0) * (0.55 + 0.45 * (-self.t * 2.0).exp()) * self.amp;
                 self.ph = (self.ph + self.freq * dt).fract();
                 self.t += dt;
                 return ((TAU * self.ph).sin() * 1.6).tanh() * 0.35 * env * self.vel;
@@ -382,6 +610,147 @@ struct Comb {
     buf: Vec<f32>,
     i: usize,
     lp: f32,
+}
+
+/// A second-order filter (RBJ cookbook), run in transposed direct form II.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Biquad {
+    b: [f32; 3],
+    a: [f32; 2],
+}
+
+impl Biquad {
+    fn from(b: [f32; 3], a: [f32; 3]) -> Self {
+        Biquad { b: [b[0] / a[0], b[1] / a[0], b[2] / a[0]], a: [a[1] / a[0], a[2] / a[0]] }
+    }
+
+    /// `kind`: 0 low shelf, 1 bell (Q 0.9), 2 high shelf; `db` of boost or cut at `f` Hz.
+    fn eq(kind: u8, f: f32, db: f32, sr: f32) -> Self {
+        // Kept below the Nyquist frequency, so low sample rates stay stable.
+        let w = TAU * f.min(0.45 * sr) / sr;
+        let (cw, sw) = (w.cos(), w.sin());
+        let a = 10f32.powf(db / 40.0);
+        if kind == 1 {
+            let al = sw / (2.0 * 0.9);
+            return Biquad::from([1.0 + al * a, -2.0 * cw, 1.0 - al * a], [1.0 + al / a, -2.0 * cw, 1.0 - al / a]);
+        }
+        // Shelves with slope 1.
+        let al = sw / 2.0 * SQRT_2;
+        let s = 2.0 * a.sqrt() * al;
+        if kind == 0 {
+            Biquad::from([a * ((a + 1.0) - (a - 1.0) * cw + s), 2.0 * a * ((a - 1.0) - (a + 1.0) * cw), a * ((a + 1.0) - (a - 1.0) * cw - s)], [(a + 1.0) + (a - 1.0) * cw + s, -2.0 * ((a - 1.0) + (a + 1.0) * cw), (a + 1.0) + (a - 1.0) * cw - s])
+        } else {
+            Biquad::from([a * ((a + 1.0) + (a - 1.0) * cw + s), -2.0 * a * ((a - 1.0) + (a + 1.0) * cw), a * ((a + 1.0) + (a - 1.0) * cw - s)], [(a + 1.0) - (a - 1.0) * cw + s, 2.0 * ((a - 1.0) - (a + 1.0) * cw), (a + 1.0) - (a - 1.0) * cw - s])
+        }
+    }
+
+    /// Low-pass (`high_pass` false) or high-pass at `f` Hz, Q 0.707.
+    fn pass(high_pass: bool, f: f32, sr: f32) -> Self {
+        let w = TAU * f.min(0.45 * sr) / sr;
+        let (cw, al) = (w.cos(), w.sin() / SQRT_2);
+        let a = [1.0 + al, -2.0 * cw, 1.0 - al];
+        if high_pass { Biquad::from([(1.0 + cw) / 2.0, -(1.0 + cw), (1.0 + cw) / 2.0], a) } else { Biquad::from([(1.0 - cw) / 2.0, 1.0 - cw, (1.0 - cw) / 2.0], a) }
+    }
+
+    fn run(&self, z: &mut [f32; 2], x: f32) -> f32 {
+        let y = self.b[0] * x + z[0];
+        z[0] = self.b[1] * x - self.a[0] * y + z[1];
+        z[1] = self.b[2] * x - self.a[1] * y;
+        y
+    }
+}
+
+/// A mixer track's EQ bands and filter, worked out when a snapshot arrives; `None` is a stage
+/// left out (flat), so untouched tracks cost nothing and sound exactly as before.
+#[derive(Clone, Copy)]
+struct TrackCoefs {
+    stages: [Option<Biquad>; 4],
+}
+
+impl TrackCoefs {
+    const FLAT: TrackCoefs = TrackCoefs { stages: [None; 4] };
+
+    fn new(fx: &TrackFx, sr: f32) -> Self {
+        let band = |kind: u8, f: f32, db: f32| (db.abs() > 0.05).then(|| Biquad::eq(kind, f, db, sr));
+        let filter = match fx.filter {
+            x if x < -0.01 => Some(Biquad::pass(false, 20000.0 * (150.0f32 / 20000.0).powf(-x), sr)),
+            x if x > 0.01 => Some(Biquad::pass(true, 20.0 * 250f32.powf(x), sr)),
+            _ => None,
+        };
+        TrackCoefs { stages: [band(0, 200.0, fx.low), band(1, 1000.0, fx.mid), band(2, 5000.0, fx.high), filter] }
+    }
+}
+
+/// The shared delay: echoes that bounce between left and right, a little darker each time.
+struct Delay {
+    buf: [Vec<f32>; 2],
+    i: usize,
+    /// Low-pass state of the feedback, per side.
+    lp: [f32; 2],
+}
+
+impl Delay {
+    /// Longest delay, in seconds.
+    const MAX: f32 = 4.0;
+
+    fn new(sr: f32) -> Self {
+        let n = (Delay::MAX * sr) as usize + 1;
+        Delay { buf: [vec![0.0; n], vec![0.0; n]], i: 0, lp: [0.0; 2] }
+    }
+
+    fn process(&mut self, x: [f32; 2], samples: usize, feedback: f32) -> [f32; 2] {
+        let n = self.buf[0].len();
+        let r = (self.i + n - samples.clamp(1, n - 1)) % n;
+        let out = [self.buf[0][r], self.buf[1][r]];
+        for side in 0..2 {
+            // Each side feeds the other: ping-pong.
+            self.lp[side] += 0.5 * (out[1 - side] - self.lp[side]);
+            self.buf[side][self.i] = x[side] + self.lp[side] * feedback;
+        }
+        self.i = (self.i + 1) % n;
+        out
+    }
+}
+
+/// The shared reverb: eight damped combs into four allpasses per side (Freeverb's layout).
+struct Reverb {
+    combs: [[Comb; 8]; 2],
+    aps: [[Allpass; 4]; 2],
+}
+
+impl Reverb {
+    fn new(sr: f32) -> Self {
+        let s = |n: usize, spread: usize| (((n + spread) as f32 * sr / 44100.0) as usize).max(1);
+        let comb = |n, sp| Comb { buf: vec![0.0; s(n, sp)], i: 0, lp: 0.0 };
+        let ap = |n, sp| Allpass { buf: vec![0.0; s(n, sp)], i: 0 };
+        let side = |sp| [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617].map(|n| comb(n, sp));
+        let aps = |sp| [556, 441, 341, 225].map(|n| ap(n, sp));
+        Reverb { combs: [side(0), side(23)], aps: [aps(0), aps(23)] }
+    }
+
+    fn process(&mut self, x: [f32; 2], size: f32, damping: f32) -> [f32; 2] {
+        let (fb, damp) = (0.7 + 0.25 * size, 0.05 + 0.6 * damping);
+        let input = (x[0] + x[1]) * 0.015;
+        let mut out = [0.0; 2];
+        for ((o, combs), aps) in out.iter_mut().zip(&mut self.combs).zip(&mut self.aps) {
+            let mut wet = 0.0;
+            for c in combs.iter_mut() {
+                let y = c.buf[c.i];
+                c.lp = y * (1.0 - damp) + c.lp * damp;
+                c.buf[c.i] = input + c.lp * fb;
+                c.i = (c.i + 1) % c.buf.len();
+                wet += y;
+            }
+            for ap in aps.iter_mut() {
+                let b = ap.buf[ap.i];
+                ap.buf[ap.i] = wet + b * 0.5;
+                wet = b - wet;
+                ap.i = (ap.i + 1) % ap.buf.len();
+            }
+            *o = wet * 1.5;
+        }
+        out
+    }
 }
 
 struct Allpass {
@@ -513,11 +882,23 @@ pub struct Engine {
     chans: [ChanState; MAX_CHANNELS],
     voices: [Voice; VOICES],
     chop_voices: [ChopVoice; CHOP_VOICES],
-    rel_coef: f32,
-    /// Per-frame release multipliers for chops: after note-off (10 ms) and when cut (5 ms).
-    chop_release: f32,
+    synths: [SynthVoice; SYNTH_VOICES],
+    /// Each channel's sound settings as per-sample numbers, and its tone filter (two stages,
+    /// left and right).
+    coefs: [ChanCoefs; MAX_CHANNELS],
+    tone_lp: [[f32; 4]; MAX_CHANNELS],
+    /// Per-frame release multiplier for a chop that is cut by the next one (5 ms).
     chop_cut: f32,
     fx: [FxChain; 2],
+    /// Mixer tracks' EQ and filter, and their state (four stages, left and right).
+    track_coefs: [TrackCoefs; MAX_MIXER],
+    track_z: [[[[f32; 2]; 4]; 2]; MAX_MIXER],
+    delay: Delay,
+    reverb: Reverb,
+    /// Seconds since anything was sent to the delay and the reverb: they stop working once
+    /// their tails have died away.
+    delay_idle: f32,
+    reverb_idle: f32,
     /// 0..1 gain on the vinyl noise: ramps to 1 while playing, to 0 when stopped.
     vinyl_amt: f32,
     peaks: [f32; METERS],
@@ -556,10 +937,17 @@ impl Engine {
             chans: [ChanState::default(); MAX_CHANNELS],
             voices: [Voice::default(); VOICES],
             chop_voices: [ChopVoice::default(); CHOP_VOICES],
-            rel_coef: (-1.0 / (0.25 * sr)).exp(),
-            chop_release: (-1.0 / (0.01 * sr)).exp(),
+            synths: [SynthVoice::default(); SYNTH_VOICES],
+            coefs: [ChanCoefs::new(&Sound::default(), Instrument::Rhodes, sr); MAX_CHANNELS],
+            tone_lp: [[0.0; 4]; MAX_CHANNELS],
             chop_cut: (-1.0 / (0.005 * sr)).exp(),
             fx: [FxChain::new(sr, 0, 0x9e37_79b9), FxChain::new(sr, 23, 0x7f4a_7c15)],
+            track_coefs: [TrackCoefs::FLAT; MAX_MIXER],
+            track_z: [[[[0.0; 2]; 4]; 2]; MAX_MIXER],
+            delay: Delay::new(sr),
+            reverb: Reverb::new(sr),
+            delay_idle: f32::MAX,
+            reverb_idle: f32::MAX,
             vinyl_amt: 0.0,
             peaks: [0.0; METERS],
             metronome: false,
@@ -589,6 +977,15 @@ impl Engine {
                 let n = self.snap.channels.len();
                 for v in self.voices.iter_mut().filter(|v| v.channel as usize >= n) {
                     v.gate = false;
+                }
+                for v in self.synths.iter_mut().filter(|v| v.channel as usize >= n) {
+                    v.gate = false;
+                }
+                for (k, c) in self.coefs.iter_mut().zip(&self.snap.channels) {
+                    *k = ChanCoefs::new(&c.sound, c.instrument, self.sr);
+                }
+                for (k, m) in self.track_coefs.iter_mut().zip(&self.snap.mixer) {
+                    *k = TrackCoefs::new(&m.fx, self.sr);
                 }
                 if self.playing {
                     // Before the loop is fine (playing in from the cue); past its end wraps.
@@ -629,6 +1026,9 @@ impl Engine {
                 for v in self.chop_voices.iter_mut().filter(|v| v.live && v.channel == channel && v.note == pitch) {
                     v.gate = false;
                 }
+                for v in self.synths.iter_mut().filter(|v| v.live && v.channel == channel && v.note == pitch) {
+                    v.gate = false;
+                }
             }
         }
     }
@@ -667,6 +1067,9 @@ impl Engine {
         for v in self.chop_voices.iter_mut().filter(|v| !v.live) {
             v.gate = false;
         }
+        for v in self.synths.iter_mut().filter(|v| !v.live) {
+            v.gate = false;
+        }
     }
 
     /// Starts slice `pitch - CHOP_BASE` of the channel's chop.
@@ -682,7 +1085,8 @@ impl Engine {
                 v.release = self.chop_cut;
             }
         }
-        let step = data.sr as f64 / self.sr as f64 * slice.speed as f64;
+        let k = self.coefs.get(channel as usize).copied().unwrap_or(self.coefs[0]);
+        let step = data.sr as f64 / self.sr as f64 * slice.speed as f64 * k.ratio as f64;
         let (pos, step, stop) = if slice.reverse { (stop - 1.0, -step, start) } else { (start, step, stop) };
         // A free voice, otherwise the one closest to silence.
         let i = self.chop_voices.iter().position(|v| !v.active).unwrap_or_else(|| {
@@ -694,19 +1098,33 @@ impl Engine {
             }
             best
         });
-        self.chop_voices[i] = ChopVoice { active: true, gate: true, live, channel, chop: chop as u16, note: pitch, end, pos, step, stop, gain: slice.gain * g, env: 1.0, t: 0.0, release: 0.0 };
+        self.chop_voices[i] = ChopVoice { active: true, gate: true, live, channel, chop: chop as u16, note: pitch, end, pos, step, stop, gain: slice.gain * g, env: 1.0, t: 0.0, release: 0.0, attack: k.attack };
     }
 
     fn note_on(&mut self, channel: u16, pitch: u8, vel: u8, end: Tick, live: bool) {
         let ch = channel as usize;
         let (Some(mix), Some(st)) = (self.snap.channels.get(ch), self.chans.get_mut(ch)) else { return };
         let g = vel as f32 / 100.0;
+        let freq = midi_hz(pitch) * self.coefs[ch].ratio;
         match mix.instrument {
             Instrument::Kick | Instrument::Snare | Instrument::Hat => {
                 st.hit_t = 0.0;
                 st.hit_vel = g;
             }
-            Instrument::Bass => *st = ChanState { note: pitch, freq: midi_hz(pitch), t: 0.0, gate: true, live, amp: 1.0, vel: g, end, ..*st },
+            Instrument::Bass => *st = ChanState { note: pitch, freq, t: 0.0, gate: true, live, amp: 1.0, vel: g, end, ..*st },
+            Instrument::Synth => {
+                // Free voice first, otherwise steal the quietest.
+                let i = self.synths.iter().position(|v| !v.active).unwrap_or_else(|| {
+                    let mut best = 0;
+                    for (i, v) in self.synths.iter().enumerate() {
+                        if v.level < self.synths[best].level {
+                            best = i;
+                        }
+                    }
+                    best
+                });
+                self.synths[i] = SynthVoice { active: true, gate: true, live, channel, note: pitch, end, freq, vel: g, fenv: 1.0, ..SynthVoice::default() };
+            }
             Instrument::Chop => {
                 if let Some(chop) = mix.chop {
                     self.chop_on(channel, chop, pitch, g, end, live);
@@ -723,7 +1141,7 @@ impl Engine {
                     }
                     best
                 });
-                self.voices[i] = Voice { active: true, gate: true, live, channel, note: pitch, end, freq: midi_hz(pitch), vel: 0.3 * g, rel: 1.0, ..Voice::default() };
+                self.voices[i] = Voice { active: true, gate: true, live, channel, note: pitch, end, freq, vel: 0.3 * g, rel: 1.0, ..Voice::default() };
             }
         }
     }
@@ -736,6 +1154,9 @@ impl Engine {
             self.seek(t);
         }
         for v in self.voices.iter_mut().filter(|v| v.gate && !v.live && v.end <= t) {
+            v.gate = false;
+        }
+        for v in self.synths.iter_mut().filter(|v| v.gate && !v.live && v.end <= t) {
             v.gate = false;
         }
         for c in self.chans.iter_mut().filter(|c| c.gate && !c.live && c.end <= t) {
@@ -776,19 +1197,29 @@ impl Engine {
             self.to_next -= 1.0;
         }
 
-        let (dt, rc) = (self.dt, self.rel_coef);
+        let dt = self.dt;
         let n = self.snap.channels.len().min(MAX_CHANNELS);
         let mut ch = [[0.0f32; 2]; MAX_CHANNELS];
         for (i, out) in ch.iter_mut().enumerate().take(n) {
-            let x = self.chans[i].render(self.snap.channels[i].instrument, dt, rc, &mut self.rng);
+            let x = self.chans[i].render(self.snap.channels[i].instrument, dt, &self.coefs[i], &mut self.rng);
             *out = [x, x];
         }
         for v in self.voices.iter_mut().filter(|v| v.active) {
-            let out = v.tick(dt, rc);
+            let Some(k) = self.coefs.get(v.channel as usize) else { continue };
+            let out = v.tick(dt, k);
             if let Some(c) = ch.get_mut(v.channel as usize) {
                 c[0] += out;
                 c[1] += out;
             }
+        }
+        for v in self.synths.iter_mut().filter(|v| v.active) {
+            let (Some(k), Some(mix)) = (self.coefs.get(v.channel as usize), self.snap.channels.get(v.channel as usize)) else {
+                v.active = false;
+                continue;
+            };
+            let out = v.tick(&mix.sound, k, dt, self.sr);
+            ch[v.channel as usize][0] += out;
+            ch[v.channel as usize][1] += out;
         }
         for v in self.chop_voices.iter_mut().filter(|v| v.active) {
             let Some(data) = self.snap.chops.get(v.chop as usize).and_then(|c| c.sample.as_deref()) else {
@@ -797,12 +1228,22 @@ impl Engine {
             };
             let one_shot = self.snap.chops[v.chop as usize].one_shot;
             if !v.gate && !one_shot && v.release == 0.0 {
-                v.release = self.chop_release;
+                v.release = self.coefs.get(v.channel as usize).map_or(0.99, |k| k.release);
             }
             let [l, r] = v.tick(data, dt);
             if let Some(c) = ch.get_mut(v.channel as usize) {
                 c[0] += l;
                 c[1] += r;
+            }
+        }
+        // Each channel's tone: two one-pole low-passes, skipped when open.
+        for ((out, k), lp) in ch.iter_mut().zip(&self.coefs).zip(self.tone_lp.iter_mut()).take(n) {
+            if k.tone < 1.0 {
+                for (side, x) in out.iter_mut().enumerate() {
+                    lp[side] += k.tone * (*x - lp[side]);
+                    lp[side + 2] += k.tone * (lp[side] - lp[side + 2]);
+                    *x = lp[side + 2];
+                }
             }
         }
 
@@ -813,11 +1254,36 @@ impl Engine {
             b[1] += r * c.gain[1];
         }
         let mut mix = [0.0; 2];
+        let (mut to_delay, mut to_reverb) = ([0.0f32; 2], [0.0f32; 2]);
         for (m, (mx, [l, r])) in self.snap.mixer.iter().zip(bus).enumerate().filter(|(_, (mx, _))| !mx.mute) {
-            let (l, r) = (l * mx.gain[0], r * mx.gain[1]);
-            self.peaks[m] = self.peaks[m].max(l.abs()).max(r.abs());
-            mix[0] += l;
-            mix[1] += r;
+            let mut out = [l * mx.gain[0], r * mx.gain[1]];
+            // EQ and filter; stages left flat are skipped.
+            for (stage, bq) in self.track_coefs[m].stages.iter().enumerate() {
+                if let Some(bq) = bq {
+                    for (side, x) in out.iter_mut().enumerate() {
+                        *x = bq.run(&mut self.track_z[m][side][stage], *x);
+                    }
+                }
+            }
+            self.peaks[m] = self.peaks[m].max(out[0].abs()).max(out[1].abs());
+            for side in 0..2 {
+                mix[side] += out[side];
+                to_delay[side] += out[side] * mx.fx.delay;
+                to_reverb[side] += out[side] * mx.fx.reverb;
+            }
+        }
+        // The shared delay and reverb, while anything goes in or their tails still ring.
+        let sends = self.snap.sends;
+        self.delay_idle = if to_delay != [0.0; 2] { 0.0 } else { self.delay_idle + self.dt };
+        if self.delay_idle < Delay::MAX * 12.0 {
+            let samples = (sends.delay_steps.round() * 15.0 / self.snap.bpm * self.sr) as usize;
+            let echo = self.delay.process(to_delay, samples, sends.feedback);
+            mix = [mix[0] + echo[0], mix[1] + echo[1]];
+        }
+        self.reverb_idle = if to_reverb != [0.0; 2] { 0.0 } else { self.reverb_idle + self.dt };
+        if self.reverb_idle < 10.0 {
+            let wet = self.reverb.process(to_reverb, sends.size, sends.damping);
+            mix = [mix[0] + wet[0], mix[1] + wet[1]];
         }
 
         let ramp = self.dt / VINYL_FADE;
@@ -879,8 +1345,8 @@ mod tests {
     /// One mixer track, the given channels, these notes, a 1-bar loop.
     fn snap(instruments: &[Instrument], notes: &[SeqNote]) -> Snapshot {
         Snapshot {
-            channels: instruments.iter().map(|&instrument| ChannelMix { instrument, gain: UNITY, mute: false, mixer: 0, chop: None }).collect(),
-            mixer: vec![MixerMix { gain: UNITY, mute: false }],
+            channels: instruments.iter().map(|&instrument| ChannelMix { instrument, sound: Sound::default(), gain: UNITY, mute: false, mixer: 0, chop: None }).collect(),
+            mixer: vec![MixerMix { gain: UNITY, mute: false, fx: TrackFx::default() }],
             notes: notes.to_vec(),
             ..Snapshot::default()
         }
@@ -1022,14 +1488,14 @@ mod tests {
         s.channels[0].mute = false;
         s.mixer[0].mute = true;
         assert!(peak(&mut engine(&s, 22050.0), 2205)[0] < 1e-3);
-        s.mixer[0] = MixerMix { gain: [0.0, 0.0], mute: false };
+        s.mixer[0] = MixerMix { gain: [0.0, 0.0], mute: false, fx: TrackFx::default() };
         assert!(peak(&mut engine(&s, 22050.0), 2205)[0] < 1e-3);
     }
 
     #[test]
     fn meters_follow_mixer_routing() {
         let mut s = snap(&[Instrument::Kick, Instrument::Rhodes], &[note(1, 72, 0, 2 * STEP)]);
-        s.mixer.push(MixerMix { gain: UNITY, mute: false });
+        s.mixer.push(MixerMix { gain: UNITY, mute: false, fx: TrackFx::default() });
         s.channels[1].mixer = 1;
         let mut e = engine(&s, 22050.0);
         assert!(peak(&mut e, 2205)[0] > 0.05);
@@ -1129,6 +1595,155 @@ mod tests {
         assert!(e.voices.iter().all(|v| !v.active));
     }
 
+    /// Renders `frames` of one channel playing `pitch` from tick 0 for a beat, with `sound`.
+    fn one_note(inst: Instrument, sound: Sound, pitch: u8, frames: usize) -> Vec<f32> {
+        let mut s = snap(&[inst], &[note(0, pitch, 0, PPQ)]);
+        s.channels[0].sound = sound;
+        s.loop_end = 64 * PPQ;
+        let mut e = engine(&s, 16000.0);
+        (0..frames).map(|_| e.next_frame()[0]).collect()
+    }
+
+    /// Upward zero crossings per second: the pitch of a simple tone.
+    fn crossings(x: &[f32], sr: f32) -> f32 {
+        x.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count() as f32 / (x.len() as f32 / sr)
+    }
+
+    /// How much of the signal is high frequencies: energy of the sample-to-sample difference
+    /// against the energy of the signal.
+    fn brightness(x: &[f32]) -> f32 {
+        let e: f32 = x.iter().map(|v| v * v).sum();
+        x.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>() / e.max(1e-12)
+    }
+
+    #[test]
+    fn synth_plays_in_tune_and_its_filter_and_envelope_work() {
+        let sr = 16000.0;
+        let open = Sound { cutoff: 1.0, envelope: 0.0, resonance: 0.0, ..Sound::default() };
+        // A4 = 440 Hz: a saw crosses zero upwards once a cycle.
+        let a4 = one_note(Instrument::Synth, Sound { detune: 0.0, ..open }, 69, 8000);
+        assert!((crossings(&a4[800..6000], sr) - 440.0).abs() < 8.0, "{}", crossings(&a4[800..6000], sr));
+        // A closed filter is darker; the square is louder in its upper partials than nothing.
+        let dark = one_note(Instrument::Synth, Sound { cutoff: 0.2, ..open }, 57, 6000);
+        let bright = one_note(Instrument::Synth, open, 57, 6000);
+        assert!(brightness(&dark[1000..5000]) < 0.3 * brightness(&bright[1000..5000]));
+        // The envelope opens the filter at the start of the note, then it closes again.
+        let swept = one_note(Instrument::Synth, Sound { cutoff: 0.2, envelope: 1.0, decay: 0.1, ..open }, 57, 8000);
+        assert!(brightness(&swept[100..600]) > 2.0 * brightness(&swept[5000..7000]));
+        // Sustain holds the level while the note lasts (a beat at 120 BPM = 0.5 s), then it
+        // releases: a short release dies away much faster than a long one.
+        let level = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let held = one_note(Instrument::Synth, Sound { sustain: 0.5, decay: 0.05, release: 0.2, ..open }, 57, 16000);
+        let ringing = one_note(Instrument::Synth, Sound { sustain: 0.5, decay: 0.05, release: 4.0, ..open }, 57, 16000);
+        assert!(level(&held[6000..7000]) > 0.05 && level(&held[6000..7000]) > 0.8 * level(&held[4000..5000]));
+        assert!(level(&held[14000..15000]) < 1e-3 && level(&ringing[14000..15000]) > 0.5 * level(&ringing[6000..7000]));
+        // Slow attack: quiet at first.
+        let slow = one_note(Instrument::Synth, Sound { attack: 0.2, ..open }, 57, 6000);
+        assert!(level(&slow[0..320]) < 0.3 * level(&slow[3200..4000]));
+    }
+
+    #[test]
+    fn sound_settings_change_every_instrument() {
+        let sr = 16000.0;
+        let level = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        // Pitch: an octave up doubles the frequency (the bass is a near-sine).
+        let bass = one_note(Instrument::Bass, Sound::default(), 45, 6000);
+        let up = one_note(Instrument::Bass, Sound { pitch: 12.0, ..Sound::default() }, 45, 6000);
+        let ratio = crossings(&up[500..5500], sr) / crossings(&bass[500..5500], sr);
+        assert!((ratio - 2.0).abs() < 0.05, "{ratio}");
+        // Tone: the hat through a closed tone filter is much darker.
+        let hat = one_note(Instrument::Hat, Sound::default(), 60, 1600);
+        let muffled = one_note(Instrument::Hat, Sound { tone: 0.2, ..Sound::default() }, 60, 1600);
+        assert!(brightness(&muffled) < 0.2 * brightness(&hat));
+        // Release: a kick set to ring longer is still sounding when the normal one is gone.
+        let kick = one_note(Instrument::Kick, Sound::default(), 60, 16000);
+        let long = one_note(Instrument::Kick, Sound { release: 4.0, ..Sound::default() }, 60, 16000);
+        // (The master chain delays everything by a few milliseconds.)
+        assert!(level(&kick[9800..11200]) < 1e-3 && level(&long[9800..11200]) > 0.01, "{} {}", level(&kick[9800..11200]), level(&long[9800..11200]));
+        // Attack: the electric piano fades in.
+        let keys = one_note(Instrument::Rhodes, Sound::default(), 60, 4000);
+        let soft = one_note(Instrument::Rhodes, Sound { attack: 0.1, ..Sound::default() }, 60, 4000);
+        assert!(level(&soft[0..160]) < 0.3 * level(&keys[0..160]));
+        // Defaults are in range; out-of-range settings are caught.
+        assert!(Sound::default().is_valid() && !Sound { pitch: 30.0, ..Sound::default() }.is_valid() && !Sound { tone: f32::NAN, ..Sound::default() }.is_valid());
+    }
+
+    /// Gain in dB of `bq` for a sine at `f` Hz.
+    fn gain_db(bq: &Biquad, f: f32, sr: f32) -> f32 {
+        let mut z = [0.0; 2];
+        let n = sr as usize;
+        let (mut e_in, mut e_out) = (0.0, 0.0);
+        for i in 0..n {
+            let x = (TAU * f * i as f32 / sr).sin();
+            let y = bq.run(&mut z, x);
+            if i > n / 2 {
+                e_in += x * x;
+                e_out += y * y;
+            }
+        }
+        10.0 * (e_out / e_in).log10()
+    }
+
+    #[test]
+    fn eq_and_filter_shapes() {
+        let sr = 44100.0;
+        let near = |got: f32, want: f32| (got - want).abs() < 1.0;
+        let low = Biquad::eq(0, 200.0, 12.0, sr);
+        assert!(near(gain_db(&low, 40.0, sr), 12.0) && near(gain_db(&low, 5000.0, sr), 0.0));
+        let bell = Biquad::eq(1, 1000.0, -6.0, sr);
+        assert!(near(gain_db(&bell, 1000.0, sr), -6.0) && near(gain_db(&bell, 60.0, sr), 0.0) && near(gain_db(&bell, 15000.0, sr), 0.0));
+        let high = Biquad::eq(2, 5000.0, -12.0, sr);
+        assert!(near(gain_db(&high, 16000.0, sr), -12.0) && near(gain_db(&high, 100.0, sr), 0.0));
+        let lp = Biquad::pass(false, 1000.0, sr);
+        assert!(near(gain_db(&lp, 100.0, sr), 0.0) && near(gain_db(&lp, 1000.0, sr), -3.0) && gain_db(&lp, 8000.0, sr) < -30.0);
+        let hp = Biquad::pass(true, 1000.0, sr);
+        assert!(near(gain_db(&hp, 10000.0, sr), 0.0) && gain_db(&hp, 125.0, sr) < -30.0);
+        // At a low sample rate, bands above half of it stay stable.
+        let z = &mut [0.0; 2];
+        let shelf = Biquad::eq(2, 5000.0, 12.0, 8000.0);
+        assert!((0..8000).map(|i| shelf.run(z, (i as f32 * 0.7).sin())).all(|y| y.is_finite() && y.abs() < 10.0));
+        // Flat settings add no stage at all; the filter knob sweeps its cutoff.
+        assert!(TrackCoefs::new(&TrackFx::default(), sr).stages.iter().all(Option::is_none));
+        let dark = TrackCoefs::new(&TrackFx { filter: -0.5, ..TrackFx::default() }, sr).stages[3].unwrap();
+        assert!(gain_db(&dark, 6000.0, sr) < -6.0 && near(gain_db(&dark, 200.0, sr), 0.0));
+        assert!(TrackFx::default().is_valid() && !TrackFx { low: 20.0, ..TrackFx::default() }.is_valid());
+        assert!(Sends::default().is_valid() && !Sends { feedback: 1.0, ..Sends::default() }.is_valid());
+    }
+
+    #[test]
+    fn mixer_filter_delay_and_reverb() {
+        let sr = 16000.0;
+        // A hat and a kick at the start, panned hard left, through mixer track 0.
+        let run = |fx: TrackFx, sends: Sends, frames: usize| {
+            let mut s = snap(&[Instrument::Hat, Instrument::Kick], &[note(0, 60, 0, STEP), note(1, 60, 0, STEP)]);
+            s.loop_end = 64 * PPQ;
+            s.channels[0].gain = [1.0, 0.0];
+            s.channels[1].gain = [1.0, 0.0];
+            (s.mixer[0].fx, s.sends) = (fx, sends);
+            let mut e = engine(&s, sr);
+            (0..frames).map(|_| e.next_frame()).collect::<Vec<[f32; 2]>>()
+        };
+        let left = |x: &[[f32; 2]]| x.iter().map(|f| f[0]).collect::<Vec<f32>>();
+        let level = |x: &[[f32; 2]], side: usize| x.iter().fold(0f32, |m, f| m.max(f[side].abs()));
+        // The filter knob turned left darkens the track.
+        let plain = run(TrackFx::default(), Sends::default(), 2400);
+        let filtered = run(TrackFx { filter: -0.7, ..TrackFx::default() }, Sends::default(), 2400);
+        assert!(brightness(&left(&filtered)) < 0.3 * brightness(&left(&plain)));
+        // Delay of four 16ths at 120 BPM: 0.5 s. With no send there is nothing after the hit;
+        // with it, the first echo comes back on the left and the next one bounces to the right.
+        let dry = run(TrackFx::default(), Sends::default(), 20000);
+        let echo = run(TrackFx { delay: 1.0, ..TrackFx::default() }, Sends { delay_steps: 4.0, feedback: 0.5, ..Sends::default() }, 20000);
+        let window = |x: &[[f32; 2]], t: f32| x[(t * sr) as usize..((t + 0.1) * sr) as usize].to_vec();
+        assert!(level(&window(&dry, 0.62), 0) < 1e-3);
+        assert!(level(&window(&echo, 0.5), 0) > 0.2 && level(&window(&echo, 0.5), 1) < 0.02);
+        assert!(level(&window(&echo, 1.0), 1) > 0.05);
+        // Reverb: a tail after the hit has ended, longer for a bigger room.
+        let room = |size: f32| run(TrackFx { reverb: 1.0, ..TrackFx::default() }, Sends { size, ..Sends::default() }, 32000);
+        let (small, big) = (room(0.1), room(1.0));
+        assert!(level(&window(&small, 0.7), 0) > 1e-3);
+        assert!(level(&window(&big, 1.0), 0) > 10.0 * level(&window(&small, 1.0), 0));
+    }
+
     #[test]
     fn play_starts_from_the_cue_and_seek_jumps() {
         // One note per beat, pitch 60 + beat, over two bars; beats last 0.125 s at 480 BPM.
@@ -1222,6 +1837,18 @@ mod tests {
         let chop = chop_snap(SampleData { sr: 44100, frames: sine(44100, 44100, 220.0) }, &[(0, 20000), (20000, 44100)], true, true);
         base.channels.push(ChannelMix { chop: Some(0), ..chop.channels[0] });
         base.chops = chop.chops;
+        // And a synth (index 7) with a darker tone, playing chords every beat.
+        base.channels.push(ChannelMix { instrument: Instrument::Synth, sound: Sound { tone: 0.5, ..Sound::default() }, ..base.channels[0] });
+        for beat in 0..16 {
+            for p in [57, 60, 64] {
+                base.notes.push(note(7, p, beat * PPQ, PPQ / 2));
+            }
+        }
+        base.notes.sort_by_key(|n| n.start);
+        // Every mixer effect on, so their paths run too.
+        for m in &mut base.mixer {
+            m.fx = TrackFx { low: 3.0, mid: -2.0, high: 4.0, filter: -0.3, delay: 0.4, reverb: 0.5 };
+        }
         let mut e = Engine::new(22050.0).with_trash(trash_tx);
         // Like the app's UI thread: build snapshots, try_send them, free what comes back.
         let ui = std::thread::spawn(move || {

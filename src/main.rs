@@ -153,14 +153,16 @@ enum Win {
     Roll,
     Mixer,
     Chop,
+    Sound,
 }
 
-const WINDOWS: [(Win, &str, Key); 5] = [
+const WINDOWS: [(Win, &str, Key); 6] = [
     (Win::Playlist, "▤ Playlist", Key::F5),
     (Win::Rack, "▦ Rack", Key::F6),
     (Win::Roll, "♫ Roll", Key::F7),
     (Win::Chop, "✂ Sampler", Key::F8),
     (Win::Mixer, "☰ Mixer", Key::F9),
+    (Win::Sound, "〰 Sound", Key::F10),
 ];
 
 /// Audio files the sampler can load.
@@ -223,7 +225,7 @@ struct App {
     audio: Option<Audio>,
     status: String,
     export_rx: Option<mpsc::Receiver<String>>,
-    open: [bool; 5],
+    open: [bool; 6],
     /// Smoothed meter levels for display.
     meters: [f32; METERS],
     /// Playlist selection; a chord clicked in the browser is stamped there.
@@ -330,7 +332,7 @@ impl App {
             audio,
             status,
             export_rx: None,
-            open: [true, true, false, false, false],
+            open: [true, true, false, false, false, false],
             meters: [0.0; METERS],
             sel_bar: 0,
             sel_clips: Vec::new(),

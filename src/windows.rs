@@ -2,7 +2,7 @@
 //! `app.project` through its editing operations and draw previews from `app.snap`.
 
 use crate::engine::*;
-use crate::project::{CHOP_BASE, CHORDS, ChannelId, Clip, ClipId, DEFAULT_VEL, Edge, MAX_BARS, MAX_SLICES, Note, NoteId, PatternId, Project};
+use crate::project::{CHOP_BASE, CHORDS, ChannelId, Sound, TrackFx, Clip, ClipId, DEFAULT_VEL, Edge, MAX_BARS, MAX_SLICES, Note, NoteId, PatternId, Project};
 use crate::sample;
 use crate::widgets::*;
 use crate::{App, Win, channel_color, chord_color, pattern_color};
@@ -30,12 +30,14 @@ pub fn show(app: &mut App, ctx: &egui::Context, area: Rect) {
         _ => "Piano Roll".into(),
     };
     let chop_title = app.chop_ch.and_then(|c| app.project.channel(c)).map_or("Sampler".into(), |c| format!("Sampler — {}", c.name));
-    let specs: [(Win, &str, Pos2, [f32; 2]); 5] = [
+    let sound_title = app.project.channel(app.live).map_or("Sound".into(), |c| format!("Sound — {}", c.name));
+    let specs: [(Win, &str, Pos2, [f32; 2]); 6] = [
         (Win::Playlist, "Playlist", o + vec2(16.0, 16.0), [860.0, 236.0]),
-        (Win::Rack, "Channel Rack", o + vec2(16.0, 290.0), [560.0, 250.0]),
+        (Win::Rack, "Channel Rack", o + vec2(16.0, 290.0), [600.0, 250.0]),
         (Win::Roll, &roll_title, o + vec2(80.0, 40.0), [820.0, 530.0]),
-        (Win::Mixer, "Mixer", o + vec2(600.0, 290.0), [620.0, 270.0]),
+        (Win::Mixer, "Mixer", o + vec2(150.0, 200.0), [980.0, 360.0]),
         (Win::Chop, &chop_title, o + vec2(120.0, 40.0), [760.0, 430.0]),
+        (Win::Sound, &sound_title, o + vec2(600.0, 40.0), [430.0, 260.0]),
     ];
     for (w, title, pos, size) in specs {
         let mut open = app.is_open(w);
@@ -53,6 +55,7 @@ pub fn show(app: &mut App, ctx: &egui::Context, area: Rect) {
                 Win::Roll => piano_roll(app, ui),
                 Win::Mixer => mixer(app, ui),
                 Win::Chop => sampler(app, ui),
+                Win::Sound => sound(app, ui),
             });
         if !open {
             app.open[w as usize] = false;
@@ -79,6 +82,37 @@ fn rack(app: &mut App, ui: &mut Ui) {
         if ui.small_button("+").on_hover_text("New empty pattern").clicked() {
             app.pattern = app.project.new_pattern();
         }
+        ui.separator();
+        ui.menu_button("+ Add", |ui| {
+            for inst in [Instrument::Synth, Instrument::Rhodes, Instrument::Bass, Instrument::Kick, Instrument::Snare, Instrument::Hat] {
+                let label = match inst {
+                    Instrument::Synth => "Synth (saw/square, filter)",
+                    Instrument::Rhodes => "Keys (electric piano)",
+                    Instrument::Bass => "Bass",
+                    _ => Project::instrument_name(inst),
+                };
+                if ui.button(label).clicked() {
+                    match app.project.add_instrument(inst) {
+                        Some(id) => {
+                            app.live = id;
+                            if !inst.is_drum() {
+                                app.edit_channel(id);
+                            }
+                            app.open[Win::Sound as usize] = true;
+                        }
+                        None => app.status = "The rack is full.".into(),
+                    }
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("Sample to chop…").clicked() {
+                app.load_sample_dialog();
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("Add an instrument channel");
     });
     ui.add_space(2.0);
     let pat = app.pattern;
@@ -123,6 +157,11 @@ fn rack(app: &mut App, ui: &mut Ui) {
                         ui.close();
                     }
                 });
+                let open = app.open[Win::Sound as usize] && app.live == id;
+                if ui.add(egui::Button::selectable(open, "〰")).on_hover_text(format!("{name}'s sound: pitch, tone, attack, release")).clicked() {
+                    app.open[Win::Sound as usize] = !open;
+                    app.live = id;
+                }
                 ui.add_space(6.0);
                 if inst.is_drum() {
                     ui.spacing_mut().item_spacing.x = 1.0;
@@ -1034,16 +1073,101 @@ fn draw_clip(ui: &Ui, project: &Project, c: &Clip, r: Rect, muted: bool, bar_w: 
 }
 
 // ---------------------------------------------------------------------------------------------
+// Sound
+
+/// One knob with its name above and its value below.
+/// `(range, default)`: what it turns over and where double-click puts it; `(name, hint)`: what
+/// it says above it and on hover.
+fn sound_knob(ui: &mut Ui, v: &mut f32, (range, default): (std::ops::RangeInclusive<f32>, f32), (name, hint): (&str, &str), color: Color32, show: impl Fn(f32) -> String) {
+    ui.allocate_ui_with_layout(vec2(60.0, 70.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+        ui.label(RichText::new(name).small());
+        knob(ui, v, range, default, name, color).on_hover_text(format!("{hint}\nDrag or scroll to change, double-click to reset."));
+        ui.label(RichText::new(show(*v)).small().monospace().weak());
+    });
+}
+
+/// The selected channel's sound: the controls every instrument has, and the synth's own.
+fn sound(app: &mut App, ui: &mut Ui) {
+    let Some(i) = app.project.channel_index(app.live) else {
+        ui.label("Pick a channel in the Channel Rack.");
+        return;
+    };
+    let color = channel_color(i);
+    let inst = app.project.channels[i].instrument;
+    ui.horizontal(|ui| {
+        let name = &app.project.channels[i].name;
+        ui.label(RichText::new(name).color(color).strong());
+        ui.label(RichText::new(format!("· {}", Project::instrument_name(inst))).weak());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Reset").on_hover_text("Back to this instrument's own sound").clicked() {
+                app.project.channels[i].sound = Sound::default();
+            }
+        });
+    });
+    ui.label(RichText::new("Play the typing keyboard to hear it.").small().weak());
+    ui.add_space(4.0);
+    let s = &mut app.project.channels[i].sound;
+    let ms = |v: f32| if v < 1.0 { format!("{:.0} ms", v * 1000.0) } else { format!("{v:.2} s") };
+    let drum = inst.is_drum();
+    ui.horizontal(|ui| {
+        sound_knob(ui, &mut s.pitch, (-24.0..=24.0, 0.0), (if drum { "Tune" } else { "Pitch" }, "Semitones up or down"), color, |v| format!("{:+.0} st", v.round()));
+        sound_knob(ui, &mut s.tone, (0.0..=1.0, 1.0), ("Tone", "Low-pass filter: turn down for a darker, softer sound"), color, |v| if v >= 0.999 { "open".into() } else { format!("{:.0} Hz", 150.0 * (20000.0f32 / 150.0).powf(v)) });
+        if !drum {
+            sound_knob(ui, &mut s.attack, (0.0..=2.0, 0.0), ("Attack", "How long notes take to fade in"), color, |v| if v < 0.0025 { "instant".into() } else { ms(v) });
+        }
+        sound_knob(ui, &mut s.release, (0.1..=4.0, 1.0), (if drum { "Decay" } else { "Release" }, if drum { "How long hits ring" } else { "How long notes ring after they end" }), color, |v| format!("×{v:.2}"));
+    });
+    // Whole semitones: pitch is for tuning.
+    s.pitch = s.pitch.round();
+    if inst == Instrument::Synth {
+        ui.separator();
+        ui.label(RichText::new("Synth").strong());
+        ui.horizontal(|ui| {
+            sound_knob(ui, &mut s.wave, (0.0..=1.0, 0.0), ("Wave", "Oscillator shape: saw (bright, buzzy) to square (hollow)"), color, |v| match v {
+                v if v < 0.05 => "saw".into(),
+                v if v > 0.95 => "square".into(),
+                v => format!("{:.0}% sq", v * 100.0),
+            });
+            sound_knob(ui, &mut s.detune, (0.0..=50.0, 12.0), ("Detune", "Second oscillator slightly out of tune, for a wider, thicker sound"), color, |v| format!("{v:.0} ct"));
+            sound_knob(ui, &mut s.cutoff, (0.0..=1.0, 0.55), ("Cutoff", "Filter: lower is darker"), color, |v| format!("{:.0} Hz", 40.0 * 500f32.powf(v)));
+            sound_knob(ui, &mut s.resonance, (0.0..=1.0, 0.25), ("Reso", "Filter resonance: a peak at the cutoff"), color, |v| format!("{:.0}%", v * 100.0));
+        });
+        ui.horizontal(|ui| {
+            sound_knob(ui, &mut s.envelope, (0.0..=1.0, 0.45), ("Env", "How far each note opens the filter at its start"), color, |v| format!("{:.0}%", v * 100.0));
+            sound_knob(ui, &mut s.decay, (0.01..=4.0, 0.4), ("Decay", "How long the start of a note takes to settle (level and filter)"), color, ms);
+            sound_knob(ui, &mut s.sustain, (0.0..=1.0, 0.6), ("Sustain", "Level while a note is held"), color, |v| format!("{:.0}%", v * 100.0));
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Mixer
 
 fn mixer(app: &mut App, ui: &mut Ui) {
     egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
         ui.horizontal_top(|ui| {
             for (m, track) in app.project.mixer.iter_mut().enumerate().take(MAX_MIXER) {
-                strip(ui, &track.name, channel_color(m * 2), &mut track.vol, app.meters[m]);
+                strip(ui, &track.name, channel_color(m * 2), &mut track.vol, app.meters[m], Some(&mut track.fx));
             }
             ui.separator();
-            strip(ui, "Master", ACCENT, &mut app.project.master.volume, app.meters[MASTER]);
+            strip(ui, "Master", ACCENT, &mut app.project.master.volume, app.meters[MASTER], None);
+            ui.separator();
+            egui::Frame::new().fill(BG_PANEL).corner_radius(3).inner_margin(8).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Delay & Reverb").strong()).on_hover_text("Shared effects: each mixer track sends to them with its Dly and Rev knobs");
+                    ui.add_space(6.0);
+                    let s = &mut app.project.sends;
+                    ui.horizontal(|ui| {
+                        sound_knob(ui, &mut s.delay_steps, (1.0..=16.0, 3.0), ("Time", "Delay time in 16th notes (3 is a dotted 8th)"), ACCENT, |v| format!("{}/16", v.round()));
+                        sound_knob(ui, &mut s.feedback, (0.0..=0.9, 0.4), ("Feedback", "How many echoes: each comes back this much quieter"), ACCENT, |v| format!("{:.0}%", v * 100.0));
+                    });
+                    ui.horizontal(|ui| {
+                        sound_knob(ui, &mut s.size, (0.0..=1.0, 0.6), ("Size", "Reverb room size: how long it rings"), ACCENT, |v| format!("{:.0}%", v * 100.0));
+                        sound_knob(ui, &mut s.damping, (0.0..=1.0, 0.4), ("Dark", "How dark the reverb tail is"), ACCENT, |v| format!("{:.0}%", v * 100.0));
+                    });
+                    s.delay_steps = s.delay_steps.round();
+                });
+            });
             ui.separator();
             egui::Frame::new().fill(BG_PANEL).corner_radius(3).inner_margin(8).show(ui, |ui| {
                 ui.vertical(|ui| {
@@ -1076,11 +1200,40 @@ fn mixer(app: &mut App, ui: &mut Ui) {
     });
 }
 
-fn strip(ui: &mut Ui, name: &str, color: Color32, fader: &mut f32, level: f32) {
+/// A small knob with a label under it, for the mixer strips.
+fn mini_knob(ui: &mut Ui, v: &mut f32, range: std::ops::RangeInclusive<f32>, default: f32, label: &str, hint: String, color: Color32) {
+    ui.allocate_ui_with_layout(vec2(28.0, 40.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+        knob(ui, v, range, default, &hint, color).on_hover_text(hint);
+        ui.label(RichText::new(label).size(9.0).weak());
+    });
+}
+
+fn strip(ui: &mut Ui, name: &str, color: Color32, fader: &mut f32, level: f32, fx: Option<&mut TrackFx>) {
     egui::Frame::new().fill(BG_PANEL).corner_radius(3).inner_margin(6).show(ui, |ui| {
-        ui.set_width(60.0);
+        ui.set_width(90.0);
         ui.vertical_centered(|ui| {
             ui.label(RichText::new(name).color(color).strong());
+            if let Some(fx) = fx {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let db = |v: f32| format!("{v:+.1} dB · double-click: 0");
+                let (low, mid, high) = (db(fx.low), db(fx.mid), db(fx.high));
+                ui.horizontal(|ui| {
+                    mini_knob(ui, &mut fx.low, -12.0..=12.0, 0.0, "Low", format!("{name} low EQ (200 Hz): {low}"), color);
+                    mini_knob(ui, &mut fx.mid, -12.0..=12.0, 0.0, "Mid", format!("{name} mid EQ (1 kHz): {mid}"), color);
+                    mini_knob(ui, &mut fx.high, -12.0..=12.0, 0.0, "High", format!("{name} high EQ (5 kHz): {high}"), color);
+                });
+                let filter = match fx.filter {
+                    v if v < -0.01 => format!("cutting highs ({:.0}%)", -v * 100.0),
+                    v if v > 0.01 => format!("cutting lows ({:.0}%)", v * 100.0),
+                    _ => "off".into(),
+                };
+                let (delay, reverb) = (fx.delay, fx.reverb);
+                ui.horizontal(|ui| {
+                    mini_knob(ui, &mut fx.filter, -1.0..=1.0, 0.0, "Filter", format!("{name} filter: left cuts highs, right cuts lows · {filter}"), color);
+                    mini_knob(ui, &mut fx.delay, 0.0..=1.0, 0.0, "Dly", format!("{name} to the delay: {:.0}%", delay * 100.0), color);
+                    mini_knob(ui, &mut fx.reverb, 0.0..=1.0, 0.0, "Rev", format!("{name} to the reverb: {:.0}%", reverb * 100.0), color);
+                });
+            }
             ui.horizontal(|ui| {
                 meter(ui, level, 150.0);
                 ui.spacing_mut().slider_width = 150.0;

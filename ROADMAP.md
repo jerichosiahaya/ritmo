@@ -83,7 +83,9 @@ Supporting one platform instead of three saves about two months compared with a 
 - Undo/redo for every edit.
 - Unlimited patterns; any pattern placed anywhere on the playlist; move, resize, copy and delete clips; songs up to 999 bars; loop range.
 - Piano roll: note length, velocity, selection, copy/paste, snap.
-- Metronome; typing-keyboard octave shift.
+- Metronome; typing-keyboard octave shift; play from anywhere (click the ruler).
+- **Sound** (added 26 Nov): a subtractive Synth, and pitch, tone, attack and release on every instrument.
+- **Mixer effects** (added 26 Nov): 3-band EQ and a filter per mixer track; shared delay and reverb sends. (Brought forward from v0.4.)
 - Audio settings: output device, sample rate, buffer size (PipeWire/ALSA through `cpal`).
 - **Chop sampler:** load WAV/FLAC/MP3/OGG, chop at the hits, into even slices or by tapping; 16 pads played from the keyboard; per-pad pitch, reverse and level; chops sequenced as notes in the Channel Rack, Piano Roll and Playlist.
 - GitHub Actions CI (build, test, clippy).
