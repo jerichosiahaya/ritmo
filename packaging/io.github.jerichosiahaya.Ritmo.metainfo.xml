@@ -42,9 +42,9 @@
     <category>Audio</category>
   </categories>
   <releases>
-    <release version="0.2.0" date="2027-01-31">
+    <release version="0.2.0-alpha.1" date="2026-11-28" type="development">
       <description>
-        <p>First public release: projects and autosave, undo, the chop sampler, a free-form
+        <p>First public alpha: projects and autosave, undo, the chop sampler, a free-form
         playlist, piano-roll editing, a synth and sound controls, mixer effects, metronome and
         audio settings.</p>
       </description>

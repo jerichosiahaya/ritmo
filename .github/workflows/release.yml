@@ -1,7 +1,7 @@
 name: Release
 
 # Pushing a tag like v0.2.0 builds the AppImage and opens a draft GitHub release with it, to
-# review and publish by hand.
+# review and publish by hand. Tags with a suffix (v0.2.0-alpha.1) become pre-releases.
 on:
   push:
     tags: ["v*"]
@@ -26,4 +26,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           notes=$([ -f "docs/release-notes/$GITHUB_REF_NAME.md" ] && echo "--notes-file docs/release-notes/$GITHUB_REF_NAME.md" || echo "--generate-notes")
-          gh release create "$GITHUB_REF_NAME" Ritmo-*.AppImage --draft --title "Ritmo ${GITHUB_REF_NAME#v}" $notes
+          pre=$(case "$GITHUB_REF_NAME" in *-*) echo --prerelease ;; esac)
+          gh release create "$GITHUB_REF_NAME" Ritmo-*.AppImage --draft $pre --title "Ritmo ${GITHUB_REF_NAME#v}" $notes

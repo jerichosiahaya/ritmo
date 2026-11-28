@@ -1,6 +1,8 @@
 # Ritmo
 
-A complete DAW for Linux that runs on just a laptop, with sample chopping built in. Patterns and a playlist, a piano roll, a mixer and built-in instruments for any genre, plus a chop sampler: drop in any audio, chop it onto 16 pads, flip it and sequence it. Rust, egui, cpal. Early development; see [ROADMAP.md](ROADMAP.md).
+A complete DAW for Linux that runs on just a laptop, with sample chopping built in. Patterns and a playlist, a piano roll, a mixer and built-in instruments for any genre, plus a chop sampler: drop in any audio, chop it onto 16 pads, flip it and sequence it. Rust, egui, cpal.
+
+> **Alpha.** v0.2.0-alpha.1 is the first public build: it works and saves your songs, but expect rough edges, and project files may still change between versions (older files will keep opening). There are no plugins yet; CLAP plugin support comes next. Please report problems in [Issues](https://github.com/jerichosiahaya/ritmo/issues). See [ROADMAP.md](ROADMAP.md).
 
 ## Install
 

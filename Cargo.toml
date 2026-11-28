@@ -1,6 +1,6 @@
 [package]
 name = "ritmo"
-version = "0.2.0"
+version = "0.2.0-alpha.1"
 edition = "2024"
 description = "A DAW for Linux that runs on just a laptop, with sample chopping built in"
 license = "MIT"

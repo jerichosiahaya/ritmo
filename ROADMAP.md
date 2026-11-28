@@ -68,10 +68,11 @@ Each release adds to these areas. The **Release plan** below says when.
 | Version | Target | Theme | You can now… |
 |---|---|---|---|
 | v0.1 | Nov 2026 ✅ | Prototype | Make a 4-bar loop |
-| **v0.2** | **31 Jan 2027** | **Foundation — first public release** | Arrange full songs with many patterns, save them, undo anything, install from an AppImage |
-| v0.3 | Apr 2027 | **Audio & samples** | Record audio, import and edit samples and loops, use a sampler |
+| **v0.2** | **alpha 28 Nov 2026, final 31 Jan 2027** | **Foundation — first public release** | Arrange full songs with many patterns, save them, undo anything, shape sounds with a synth and mixer effects, install from an AppImage |
+| v0.3 | Mar 2027 | **CLAP plugins** (brought forward from v0.5) | Use CLAP instruments and effects (Surge XT, Vital, LSP, …) on channels and mixer tracks |
+| v0.3.x | Apr 2027 | **Audio & samples** | Record audio, import and edit samples and loops, use a sampler |
 | v0.4 | Jun 2027 | **Mixing** | Mix properly: inserts, sends, buses, sidechain, automation, pro built-in effects |
-| v0.5 | Sep 2027 | **Plugins** | Use LV2, CLAP and VST3 instruments and effects |
+| v0.5 | Sep 2027 | **More plugins** | Use LV2 and VST3 instruments and effects too; plugin automation and delay compensation |
 | v0.6 | Dec 2027 | **Instruments & MIDI** | Design sounds with built-in synths, play MIDI controllers, record MIDI |
 | v0.7 | Mar 2028 | **Advanced editing** | Comp takes, warp audio, correct pitch, change tempo over time |
 | v1.0 | Jun 2028 | **Mastering & release** | Master, meter loudness, deliver stems; install from Flathub; stable file format |
@@ -93,7 +94,16 @@ Supporting one platform instead of three saves about two months compared with a 
 
 Not in v0.2 (moved to v0.3 or later): markers, tempo and time-signature changes, recording MIDI from the keyboard, crash recovery dialog.
 
-#### v0.3 Audio & samples (Feb – Apr 2027)
+#### v0.3 CLAP plugins (Dec 2026 – Mar 2027)
+Brought forward from v0.5 after the alpha, because using existing instruments and effects matters most to people coming from other DAWs.
+- Host **CLAP** instruments (as channels) and effects (as inserts on mixer tracks), with the [clack](https://github.com/prokopyl/clack) host crate or a thin binding of our own.
+- Plugin scanning in a separate process, so a crashing plugin can't take Ritmo down; a list of what failed and why.
+- Plugin windows (X11 through XWayland on Wayland), plugin state saved in the project, parameters shown as knobs.
+- Real-time safety as for Ritmo's own instruments: plugins run on the audio thread through a pre-allocated buffer layout; no locks or allocation around them.
+- Known-good set tested in CI or by hand: Surge XT, Vital (CLAP build), Dexed, LSP, Airwindows Consolidated.
+- Windows plugins: document using them through yabridge (which can present Windows VST3 and CLAP plugins as Linux CLAP plugins).
+
+#### v0.3.x Audio & samples (Mar – Apr 2027)
 - Audio tracks and audio clips on the playlist.
 - Record from one or more inputs with monitoring; punch-in and punch-out.
 - Import WAV/FLAC/MP3/OGG/AIFF; browser with folders, search and preview.
@@ -253,7 +263,7 @@ gantt
 | 7 | 6 – 12 Jan | Free-form playlist: place, move, resize, copy, delete clips; longer songs; loop range ✅ (done early, 25 Nov; clips repeat their pattern when stretched, file format 3; snap to bar/beat/step, zoom, multi-select) |
 | 8 | 13 – 19 Jan | Piano roll: note length, velocity, selection, copy/paste, snap; metronome; octave shift; audio settings ✅ (done early, 25 Nov; also a velocity lane, box select, duplicate, arrow-key nudges, a keyboard that stays in view; settings saved per computer) |
 | 9 | 20 – 26 Jan | **Feature freeze.** AppImage and AUR packaging; demo projects; test on Arch, Ubuntu and Fedora ✅ (done early, 25 Nov; AppImage built on Ubuntu 22.04 runs on Ubuntu 24.04, Arch and Fedora 45; AUR package built with makepkg on Arch; CI builds and tests on Arch and Fedora; a draft release on each tag) |
-| 10 | 27 – 31 Jan | Demo video, release notes, tag **v0.2.0**, announce (r/linuxaudio, LinuxMusicians forum) |
+| 10 | 27 – 31 Jan | Demo video, release notes, tag **v0.2.0**, announce (r/linuxaudio, LinuxMusicians forum) — an alpha, **v0.2.0-alpha.1**, went out early on 28 Nov with a synth and mixer effects added; feedback from it goes into v0.2.0 |
 
 If weeks 1–8 run late, cut in this order: metronome, octave shift, copy/paste in the piano roll. Save/open, undo, patterns and the playlist must ship.
 

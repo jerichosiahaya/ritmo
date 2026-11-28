@@ -1,6 +1,8 @@
 # Maintainer: jerichosiahaya <https://github.com/jerichosiahaya>
 pkgname=ritmo
-pkgver=0.2.0
+_tag=v0.2.0-alpha.1
+# pacman versions cannot contain "-"; "alpha" sorts before the final 0.2.0.
+pkgver=0.2.0alpha.1
 pkgrel=1
 pkgdesc="A DAW for Linux that runs on just a laptop, with sample chopping built in"
 arch=('x86_64' 'aarch64')
@@ -11,29 +13,29 @@ makedepends=('cargo')
 optdepends=('xdg-desktop-portal: open and save dialogs'
             'pipewire-alsa: play through PipeWire'
             'pulseaudio-alsa: play through PulseAudio')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Fill in with `updpkgsums` once the v$pkgver tag is published.
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/$_tag.tar.gz")
+# Fill in with `updpkgsums` once the tag is published.
 sha256sums=('SKIP')
 
 prepare() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-${_tag#v}"
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-${_tag#v}"
     export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
     cargo build --frozen --release
 }
 
 check() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-${_tag#v}"
     export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
     cargo test --frozen --release
 }
 
 package() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-${_tag#v}"
     RITMO_BIN=target/release/ritmo ./packaging/install.sh "$pkgdir" /usr
 }
