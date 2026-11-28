@@ -53,7 +53,7 @@ Linux needs the ALSA dev package (`alsa-lib` on Arch, `libasound2-dev` on Debian
 
 ## Releasing
 
-Set the version in `Cargo.toml` (and `pkgver` in `packaging/aur/PKGBUILD`, a `<release>` in the metainfo), then push a tag `v<version>`. The release workflow tests, builds the AppImage on Ubuntu 22.04 and opens a draft GitHub release with it (notes from `docs/release-notes/v<version>.md` if present). Then run `updpkgsums` on the PKGBUILD and push it, with `makepkg --printsrcinfo > .SRCINFO`, to the AUR.
+Set the version in `Cargo.toml` (and `pkgver` in `packaging/aur/PKGBUILD`, a `<release>` in the metainfo), then push a tag `v<version>` (or run the Release workflow from the Actions tab with the tag name; the tag is then created when the draft is published). The release workflow tests, builds the AppImage on Ubuntu 22.04 and opens a draft GitHub release with it (notes from `docs/release-notes/v<version>.md` if present). Then run `updpkgsums` on the PKGBUILD and push it, with `makepkg --printsrcinfo > .SRCINFO`, to the AUR.
 
 ## Checking UI changes
 

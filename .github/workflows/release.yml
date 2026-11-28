@@ -1,13 +1,23 @@
 name: Release
 
-# Pushing a tag like v0.2.0 builds the AppImage and opens a draft GitHub release with it, to
-# review and publish by hand. Tags with a suffix (v0.2.0-alpha.1) become pre-releases.
+# Builds the AppImage and opens a draft GitHub release with it, to review and publish by hand.
+# Start it by pushing a tag like v0.2.0, or from the Actions tab ("Run workflow") with the tag
+# name: then the tag is created on the release's commit when the draft is published. Tags with a
+# suffix (v0.2.0-alpha.1) become pre-releases.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, e.g. v0.2.0-alpha.1 (must match the version in Cargo.toml)"
+        required: true
 
 permissions:
   contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -18,13 +28,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
       - name: Check the tag matches Cargo.toml
-        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)" = "$GITHUB_REF_NAME"
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)" = "$TAG"
       - run: cargo test --locked --release
       - run: packaging/appimage.sh
       - name: Draft the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes=$([ -f "docs/release-notes/$GITHUB_REF_NAME.md" ] && echo "--notes-file docs/release-notes/$GITHUB_REF_NAME.md" || echo "--generate-notes")
-          pre=$(case "$GITHUB_REF_NAME" in *-*) echo --prerelease ;; esac)
-          gh release create "$GITHUB_REF_NAME" Ritmo-*.AppImage --draft $pre --title "Ritmo ${GITHUB_REF_NAME#v}" $notes
+          notes=$([ -f "docs/release-notes/$TAG.md" ] && echo "--notes-file docs/release-notes/$TAG.md" || echo "--generate-notes")
+          pre=$(case "$TAG" in *-*) echo --prerelease ;; esac)
+          gh release create "$TAG" Ritmo-*.AppImage --draft $pre --target "$GITHUB_SHA" --title "Ritmo ${TAG#v}" $notes
